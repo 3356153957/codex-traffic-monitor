@@ -89,7 +89,8 @@ public sealed class SingleInstance : IDisposable
             return;
         }
         catch (Exception e) when (e is IOException or TimeoutException or UnauthorizedAccessException) { }
-        IntPtr window = FindWindow(null, "Codex 流量统计");
+        IntPtr window = FindWindow(null, "Codex · Claude 流量统计");
+        if (window == IntPtr.Zero) window = FindWindow(null, "Codex 流量统计");
         if (window == IntPtr.Zero) window = FindWindow(null, "Codex 流量观察");
         if (window != IntPtr.Zero) SendMessageTimeout(window, RestoreMessage, IntPtr.Zero, IntPtr.Zero, 2, 500, out _);
     }

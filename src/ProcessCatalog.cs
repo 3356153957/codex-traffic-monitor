@@ -20,10 +20,11 @@ public sealed record ProcessInfo(
     DateTime StartedAt)
 {
     public string FriendlyKind { get; init; } = "工具进程";
+    public TrackedApplication Application { get; init; } = TrackedApplication.Codex;
 }
 
 /// <summary>
-/// Tracks the Codex desktop application, its CLI, and optionally their descendants.
+/// Tracks Codex and Claude desktop applications, their CLIs, and optionally descendants.
 /// Thread safe: call Refresh on a worker, not on the WPF dispatcher.
 /// </summary>
 public sealed class ProcessCatalog
@@ -45,6 +46,7 @@ public sealed class ProcessCatalog
         public bool Core { get; set; }
         public bool Descendant { get; set; }
         public bool Excluded { get; set; }
+        public bool RuntimeCommandLineQueried { get; set; }
         public long EventVersion { get; set; }
     }
 
@@ -154,7 +156,7 @@ public sealed class ProcessCatalog
         => RecordStarted(pid, parentId, name, start, null);
 
     /// <summary>Optional path is useful when ETW observes a process that has already exited.</summary>
-    public void RecordStarted(int pid, int parentId, string name, DateTime start, string? executablePath)
+    public void RecordStarted(int pid, int parentId, string name, DateTime start, string? executablePath, string? commandLine = null)
     {
         if (pid <= 0) return;
         var eventStart = ToUtc(start);
@@ -180,7 +182,7 @@ public sealed class ProcessCatalog
             if (previous is not null && !SameIdentity(previous.Info, info))
                 RetireLocked(previous, startedAt == DateTime.MinValue ? DateTime.UtcNow : startedAt);
             BoundOlderLifetimesLocked(pid, startedAt);
-            var entry = CreateEntry(info, previous);
+            var entry = CreateEntry(info, previous, commandLine);
             entry.EventVersion = ++_version;
             _processes[pid] = entry;
             _stoppedVersions.Remove(pid);
@@ -257,7 +259,7 @@ public sealed class ProcessCatalog
     private static bool IsTracked(Entry entry, bool includeChildren)
         => !entry.Excluded && (entry.Core || (includeChildren && entry.Descendant));
 
-    private Entry CreateEntry(ProcessInfo info, Entry? previous)
+    private Entry CreateEntry(ProcessInfo info, Entry? previous, string? commandLine = null)
     {
         var sameIdentity = previous is not null && SameIdentity(previous.Info, info);
         if (sameIdentity)
@@ -266,20 +268,38 @@ public sealed class ProcessCatalog
             info = info with
             {
                 Path = info.Path.Length == 0 ? previous!.Info.Path : info.Path,
-                StartedAt = info.StartedAt == DateTime.MinValue ? previous!.Info.StartedAt : info.StartedAt
+                StartedAt = info.StartedAt == DateTime.MinValue ? previous!.Info.StartedAt : info.StartedAt,
+                Application = previous!.Info.Application
             };
         }
-        var friendlyKind = CoreKind(info.Name, info.Path);
+        var identity = CoreIdentity(info.Name, info.Path, commandLine);
+        var hasCommandLine = !string.IsNullOrWhiteSpace(commandLine);
+        var queriedRuntime = sameIdentity && previous!.RuntimeCommandLineQueried;
+        if (identity is null && IsNodeRuntime(info.Name) && !queriedRuntime && !hasCommandLine)
+        {
+            // Older npm installations run cli.js inside node.exe. Read only a
+            // candidate runtime once per process identity, and retain no command
+            // line or arguments in ProcessInfo, session files, or diagnostics.
+            var runtime = NativeProcesses.ReadRuntimeCommandLine(info.Pid);
+            if (info.StartedAt == DateTime.MinValue || runtime.Start == DateTime.MinValue || info.StartedAt == runtime.Start)
+                identity = CoreIdentity(info.Name, info.Path, runtime.CommandLine);
+            queriedRuntime = true;
+        }
+        if (identity is null && sameIdentity && previous!.Core)
+            identity = new CoreProcessIdentity(previous.Info.Application, previous.Info.FriendlyKind);
+        var application = identity?.Application ?? info.Application;
         return new Entry
         {
             Info = info with
             {
-                Kind = friendlyKind is null ? "tool" : "core",
-                FriendlyKind = friendlyKind ?? "Codex 派生工具"
+                Kind = identity is null ? "tool" : "core",
+                FriendlyKind = identity?.FriendlyKind ?? DescendantKind(application),
+                Application = application
             },
-            Core = friendlyKind is not null,
+            Core = identity is not null,
             Descendant = sameIdentity && previous!.Descendant,
             Excluded = info.Pid == _ownPid || info.ParentId == _ownPid || (sameIdentity && previous!.Excluded),
+            RuntimeCommandLineQueried = queriedRuntime || hasCommandLine,
             EventVersion = sameIdentity ? previous!.EventVersion : 0
         };
     }
@@ -293,23 +313,52 @@ public sealed class ProcessCatalog
             var changed = false;
             foreach (var entry in _processes.Values)
             {
-                if (entry.Info.ParentId == entry.Info.Pid ||
-                    !_processes.TryGetValue(entry.Info.ParentId, out var parent) ||
-                    !CanBeParent(parent.Info, entry.Info)) continue;
+                if (entry.Info.ParentId == entry.Info.Pid) continue;
+                var parent = ParentAtBirthLocked(entry.Info);
+                if (parent is null) continue;
                 if (parent.Excluded && !entry.Excluded)
                 {
                     entry.Excluded = true;
                     changed = true;
                 }
-                if ((parent.Core || parent.Descendant) && !entry.Descendant)
+                if ((parent.Core || parent.Descendant) &&
+                    (!entry.Descendant || (!entry.Core && entry.Info.Application != parent.Info.Application)))
                 {
                     entry.Descendant = true;
+                    // A nested CLI is a new application root: Claude launched
+                    // by Codex and Codex launched by Claude each own their own
+                    // descendants. Every PID has exactly one application owner.
+                    if (!entry.Core)
+                        entry.Info = entry.Info with
+                        {
+                            Application = parent.Info.Application,
+                            FriendlyKind = DescendantKind(parent.Info.Application)
+                        };
                     changed = true;
                 }
             }
             if (!changed) break;
         }
     }
+
+    private Entry? ParentAtBirthLocked(ProcessInfo child)
+    {
+        if (_processes.TryGetValue(child.ParentId, out var parent) && CanBeParent(parent.Info, child))
+            return parent;
+        // A short-lived parent's stop may be delivered before its child's start.
+        // Resolve only a bounded lifetime containing the known child birth time;
+        // an unknown timestamp must never attach a reused PID to an old owner.
+        if (child.StartedAt == DateTime.MinValue || !_recentlyExited.TryGetValue(child.ParentId, out var retired)) return null;
+        Entry? best = null;
+        foreach (var item in retired)
+            if (item.Process.Info.StartedAt != DateTime.MinValue && item.Process.Info.StartedAt <= child.StartedAt &&
+                child.StartedAt <= item.StoppedAt && (best is null || item.Process.Info.StartedAt > best.Info.StartedAt))
+                best = item.Process;
+        return best;
+    }
+
+    private static string DescendantKind(TrackedApplication application)
+        => application == TrackedApplication.Claude ? "Claude 派生工具" : "Codex 派生工具";
 
     private static bool CanBeParent(ProcessInfo parent, ProcessInfo child)
         => parent.StartedAt == DateTime.MinValue || child.StartedAt == DateTime.MinValue ||
@@ -327,29 +376,153 @@ public sealed class ProcessCatalog
              string.Equals(previous.Path, current.Path, StringComparison.OrdinalIgnoreCase));
     }
 
-    private static string? CoreKind(string name, string path)
+    private sealed record CoreProcessIdentity(TrackedApplication Application, string FriendlyKind);
+
+    private static CoreProcessIdentity? CoreIdentity(string name, string path, string? commandLine)
     {
         var file = FileName(name);
         if (!file.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) file += ".exe";
-        var normalizedPath = path.Replace('/', '\\');
+        // Reject unrelated names before path normalization/splitting. The catalog
+        // visits every Windows process on refresh, while only a few can be roots.
+        if (file.Equals("codex.exe", StringComparison.OrdinalIgnoreCase))
+            return new(TrackedApplication.Codex, "Codex CLI");
+        if (IsNodeRuntime(file))
+        {
+            if (NodeScript(commandLine) is { } script)
+            {
+                if (script.EndsWith(@"\node_modules\@anthropic-ai\claude-code\cli.js", StringComparison.OrdinalIgnoreCase))
+                    return new(TrackedApplication.Claude, "Claude Code CLI");
+                if (script.EndsWith(@"\node_modules\@openai\codex\bin\codex.js", StringComparison.OrdinalIgnoreCase))
+                    return new(TrackedApplication.Codex, "Codex CLI");
+            }
+            return null;
+        }
+        if (!file.Equals("claude.exe", StringComparison.OrdinalIgnoreCase) && !IsClaudeHelper(file) &&
+            !file.Equals("ChatGPT.exe", StringComparison.OrdinalIgnoreCase) && !IsCodexHelper(file)) return null;
+        var normalizedPath = NormalizeImagePath(path);
+        if (file.Equals("claude.exe", StringComparison.OrdinalIgnoreCase))
+        {
+            if (IsClaudeDesktopPath(normalizedPath)) return new(TrackedApplication.Claude, "Claude 桌面应用");
+            if (IsClaudeCliPath(normalizedPath)) return new(TrackedApplication.Claude, "Claude Code CLI");
+            return null;
+        }
+        if (IsClaudeDesktopPath(normalizedPath) && IsClaudeHelper(file))
+            return new(TrackedApplication.Claude, "Claude 内置助手");
         var desktopPackage = normalizedPath.Split('\\').Any(part =>
             part.StartsWith("OpenAI.Codex_", StringComparison.OrdinalIgnoreCase));
         if (file.Equals("ChatGPT.exe", StringComparison.OrdinalIgnoreCase))
-            return desktopPackage ? "Codex 桌面应用" : null;
-        if (file.Equals("codex.exe", StringComparison.OrdinalIgnoreCase))
-            return "Codex CLI";
-
+            return desktopPackage ? new(TrackedApplication.Codex, "Codex 桌面应用") : null;
         var trustedHelperPath = desktopPackage ||
             normalizedPath.Contains("\\OpenAI\\Codex\\", StringComparison.OrdinalIgnoreCase) ||
             normalizedPath.Contains("\\.codex\\", StringComparison.OrdinalIgnoreCase);
         if (!trustedHelperPath) return null;
-        var helper = file.Equals("codex-code-mode-host.exe", StringComparison.OrdinalIgnoreCase) ||
+        return IsCodexHelper(file) ? new(TrackedApplication.Codex, "Codex 内置助手") : null;
+    }
+
+    private static bool IsCodexHelper(string file)
+        => file.Equals("codex-code-mode-host.exe", StringComparison.OrdinalIgnoreCase) ||
             file.Equals("codex-exec-server.exe", StringComparison.OrdinalIgnoreCase) ||
             file.Equals("codex-windows-sandbox.exe", StringComparison.OrdinalIgnoreCase) ||
             file.Equals("codex-windows-sandbox-service.exe", StringComparison.OrdinalIgnoreCase) ||
             file.Equals("codex-sandbox-helper.exe", StringComparison.OrdinalIgnoreCase) ||
             file.Equals("codex-computer-use-swift.exe", StringComparison.OrdinalIgnoreCase);
-        return helper ? "Codex 内置助手" : null;
+
+    private static bool IsClaudeDesktopPath(string path)
+    {
+        if (!IsAbsoluteWindowsPath(path)) return false;
+        var parts = path.Split('\\');
+        for (var i = 1; i + 2 < parts.Length; i++)
+            if (parts[i - 1].Equals("WindowsApps", StringComparison.OrdinalIgnoreCase) &&
+                parts[i].StartsWith("Claude_", StringComparison.OrdinalIgnoreCase) &&
+                parts[i].EndsWith("__pzs8sxrjxfjjc", StringComparison.OrdinalIgnoreCase) &&
+                parts[i + 1].Equals("app", StringComparison.OrdinalIgnoreCase)) return true;
+        var legacyRoot = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData).TrimEnd('\\') + @"\AnthropicClaude\";
+        if (!path.StartsWith(legacyRoot, StringComparison.OrdinalIgnoreCase)) return false;
+        var remainder = path[legacyRoot.Length..];
+        if (!remainder.Contains('\\')) return true;
+        var first = remainder.Split('\\', 2)[0];
+        return first.StartsWith("app-", StringComparison.OrdinalIgnoreCase) && Version.TryParse(first[4..], out _);
+    }
+
+    private static bool IsClaudeCliPath(string path)
+    {
+        if (!IsAbsoluteWindowsPath(path) || !FileName(path).Equals("claude.exe", StringComparison.OrdinalIgnoreCase)) return false;
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile).TrimEnd('\\');
+        if (path.Equals(home + @"\.local\bin\claude.exe", StringComparison.OrdinalIgnoreCase)) return true;
+        if (path.StartsWith(home + @"\.local\share\claude\versions\", StringComparison.OrdinalIgnoreCase)) return true;
+        if (path.EndsWith(@"\node_modules\@anthropic-ai\claude-code\bin\claude.exe", StringComparison.OrdinalIgnoreCase)) return true;
+        foreach (var platform in new[] { "win32-x64", "win32-arm64" })
+            if (path.EndsWith(@"\node_modules\@anthropic-ai\claude-code-" + platform + @"\claude.exe", StringComparison.OrdinalIgnoreCase) ||
+                path.EndsWith(@"\node_modules\@anthropic-ai\claude-code-" + platform + @"\bin\claude.exe", StringComparison.OrdinalIgnoreCase)) return true;
+        var winget = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData).TrimEnd('\\') + @"\Microsoft\WinGet\Packages\Anthropic.ClaudeCode_";
+        if (path.StartsWith(winget, StringComparison.OrdinalIgnoreCase) && path[winget.Length..].Contains('\\')) return true;
+        // The official extension bundles a native Claude Code binary. Avoid
+        // matching arbitrary extensions or a parent editor's other extensions.
+        var extension = @"\.vscode\extensions\anthropic.claude-code-";
+        var extensionAt = path.IndexOf(extension, StringComparison.OrdinalIgnoreCase);
+        return extensionAt >= 0 && path.IndexOf(@"\resources\native-binary\claude.exe", extensionAt + extension.Length, StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static bool IsClaudeHelper(string file)
+        => file.Equals("chrome-native-host.exe", StringComparison.OrdinalIgnoreCase) ||
+           file.Equals("claude-make-data-folder.exe", StringComparison.OrdinalIgnoreCase) ||
+           file.Equals("claude-ssh-askpass.exe", StringComparison.OrdinalIgnoreCase) ||
+           file.Equals("claude-ssh-broker.exe", StringComparison.OrdinalIgnoreCase) ||
+           file.Equals("claude-ssh-proxy.exe", StringComparison.OrdinalIgnoreCase) ||
+           file.Equals("cowork-svc.exe", StringComparison.OrdinalIgnoreCase) ||
+           file.Equals("github-mcp-server.exe", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsNodeRuntime(string name)
+        => FileName(name).Equals("node.exe", StringComparison.OrdinalIgnoreCase) ||
+           FileName(name).Equals("node", StringComparison.OrdinalIgnoreCase);
+
+    private static string? NodeScript(string? commandLine)
+    {
+        if (string.IsNullOrWhiteSpace(commandLine) || commandLine.Length > 65536) return null;
+        var cursor = 0;
+        if (!TryReadWindowsArgument(commandLine, ref cursor, out var runtime) || !IsNodeRuntime(runtime) ||
+            !TryReadWindowsArgument(commandLine, ref cursor, out var script)) return null;
+        if (script == "--" && !TryReadWindowsArgument(commandLine, ref cursor, out script)) return null;
+        // Only the actual first script argument establishes ownership. A package
+        // name in -e code, a prompt, --require, or later data arguments does not.
+        return NormalizeImagePath(script) is { Length: > 0 } normalized ? normalized : null;
+    }
+
+    private static string NormalizeImagePath(string path)
+    {
+        var normalized = path.Replace('/', '\\');
+        if (!IsAbsoluteWindowsPath(normalized)) return "";
+        try { return System.IO.Path.GetFullPath(normalized); }
+        catch (Exception e) when (e is ArgumentException or NotSupportedException or PathTooLongException) { return ""; }
+    }
+
+    private static bool TryReadWindowsArgument(string commandLine, ref int cursor, out string argument)
+    {
+        argument = "";
+        while (cursor < commandLine.Length && char.IsWhiteSpace(commandLine[cursor])) cursor++;
+        if (cursor == commandLine.Length) return false;
+        var value = new StringBuilder();
+        var quoted = false;
+        while (cursor < commandLine.Length && (quoted || !char.IsWhiteSpace(commandLine[cursor])))
+        {
+            var slashes = 0;
+            while (cursor < commandLine.Length && commandLine[cursor] == '\\') { slashes++; cursor++; }
+            if (cursor < commandLine.Length && commandLine[cursor] == '"')
+            {
+                value.Append('\\', slashes / 2);
+                if (slashes % 2 != 0) value.Append('"'); else quoted = !quoted;
+                cursor++;
+            }
+            else
+            {
+                value.Append('\\', slashes);
+                if (cursor < commandLine.Length && (quoted || !char.IsWhiteSpace(commandLine[cursor])))
+                    value.Append(commandLine[cursor++]);
+            }
+        }
+        if (quoted) return false;
+        argument = value.ToString();
+        return argument.Length > 0;
     }
 
     private static string FileName(string? value)
@@ -413,6 +586,37 @@ public sealed class ProcessCatalog
                 }
                 if (Marshal.GetLastWin32Error() != 122) break;
             }
+            return (fullPath, ReadStart(process));
+        }
+
+        public static (string CommandLine, DateTime Start) ReadRuntimeCommandLine(int pid)
+        {
+            using var process = OpenProcess(QueryLimitedInformation, false, pid);
+            if (process.IsInvalid) return ("", DateTime.MinValue);
+            var started = ReadStart(process);
+            // ProcessCommandLineInformation returns one UNICODE_STRING followed
+            // by the UTF-16 text. Keep the native and managed allocations bounded
+            // and reject any returned pointer outside that same allocation.
+            const int processCommandLineInformation = 60;
+            int required;
+            try { _ = NtQueryInformationProcess(process, processCommandLineInformation, IntPtr.Zero, 0, out required); }
+            catch (Exception e) when (e is EntryPointNotFoundException or DllNotFoundException) { return ("", started); }
+            if (required < Marshal.SizeOf<NativeUnicodeString>() || required > 256 * 1024) return ("", started);
+            var buffer = Marshal.AllocHGlobal(required);
+            try
+            {
+                if (NtQueryInformationProcess(process, processCommandLineInformation, buffer, required, out _) < 0) return ("", started);
+                var text = Marshal.PtrToStructure<NativeUnicodeString>(buffer);
+                var offset = text.Buffer.ToInt64() - buffer.ToInt64();
+                if (text.Length == 0 || text.Length % 2 != 0 || offset < Marshal.SizeOf<NativeUnicodeString>() ||
+                    offset > required - text.Length) return ("", started);
+                return (Marshal.PtrToStringUni(text.Buffer, text.Length / 2) ?? "", started);
+            }
+            finally { Marshal.FreeHGlobal(buffer); }
+        }
+
+        private static DateTime ReadStart(SafeProcessHandle process)
+        {
             var started = DateTime.MinValue;
             if (GetProcessTimes(process, out var creation, out _, out _, out _))
             {
@@ -423,7 +627,7 @@ public sealed class ProcessCatalog
                     catch (ArgumentOutOfRangeException) { }
                 }
             }
-            return (fullPath, started);
+            return started;
         }
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -444,6 +648,13 @@ public sealed class ProcessCatalog
 
         [StructLayout(LayoutKind.Sequential)]
         private struct NativeFileTime { public uint Low; public uint High; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativeUnicodeString { public ushort Length; public ushort MaximumLength; public IntPtr Buffer; }
+
+        [DllImport("ntdll.dll")]
+        private static extern int NtQueryInformationProcess(SafeProcessHandle process, int informationClass,
+            IntPtr information, int informationLength, out int returnLength);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern SafeFileHandle CreateToolhelp32Snapshot(uint flags, uint processId);

@@ -32,7 +32,7 @@ internal sealed class TrayController : IDisposable
         _icon = new Forms.NotifyIcon
         {
             Icon = _appIcon,
-            Text = "Codex 流量统计",
+            Text = "Codex · Claude 流量统计",
             ContextMenuStrip = _menu,
             Visible = true
         };
@@ -43,14 +43,14 @@ internal sealed class TrayController : IDisposable
     {
         if (_disposed) return;
         _monitorItem.Text = running ? "暂停监控" : "开始监控";
-        _icon.Text = "Codex 流量统计 · " + (running ? "正在记录" : "监控已暂停");
+        _icon.Text = "Codex · Claude 流量统计 · " + (running ? "正在记录" : "监控已暂停");
     }
 
     public void NotifyHidden(bool running)
     {
         if (_disposed || _hasNotified) return;
         _hasNotified = true;
-        _icon.ShowBalloonTip(3500, "Codex 流量统计已收起到托盘", running
+        _icon.ShowBalloonTip(3500, "流量统计已收起到托盘", running
             ? "流量监控继续运行。双击托盘图标查看，右键选择“退出”结束程序。"
             : "当前未开始监控。双击托盘图标查看，右键可开始监控或退出程序。", Forms.ToolTipIcon.Info);
     }

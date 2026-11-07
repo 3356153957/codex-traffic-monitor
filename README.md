@@ -1,6 +1,6 @@
-# Codex Traffic Monitor · Codex 流量统计
+# Codex Traffic Monitor · Codex / Claude 流量统计
 
-Windows 本地程序，累计记录 Codex 桌面端、CLI 和派生工具进程的上下行、目标地址、地区及代理节点。首页默认显示全部历史用量，重启后继续累计。程序自身不上传监控数据，不需要修改代理、安装根证书或解密 HTTPS。
+Windows 本地程序，累计记录 Codex、Claude 桌面端、CLI 和派生工具进程的上下行、目标地址、地区及代理节点。首页默认显示两款应用的历史合计，也可分别查看，重启后继续累计。程序自身不上传监控数据，不需要修改代理、安装根证书或解密 HTTPS。
 
 [下载最新安装包](https://github.com/3356153957/codex-traffic-monitor/releases/latest) · [Windows 构建](https://github.com/3356153957/codex-traffic-monitor/actions/workflows/windows.yml) · [MIT 许可](LICENSE)
 
@@ -25,13 +25,27 @@ Windows 本地程序，累计记录 Codex 桌面端、CLI 和派生工具进程�
 
 ## 使用
 
-1. 从开始菜单、桌面快捷方式或便携目录运行 `CodexTrafficMonitor.exe`。普通权限下可查看 Codex 的现有 TCP 连接，尚未采集的字节显示为 `—`。
+1. 从开始菜单、桌面快捷方式或便携目录运行 `CodexTrafficMonitor.exe`。普通权限下可查看 Codex / Claude 的现有 TCP 连接，尚未采集的字节显示为 `—`。
 2. 点击“以管理员身份开始”，通过 Windows UAC 后自动开始记录。内核流量采集需要管理员权限。
-3. 首页突出累计总量、上行、下行和代理占比，今日用量位于累计卡片下方；可切换全部记录、今日、近 7 天、近 30 天。每日用量和去向排行随范围变化，本次会话位于底部。
+3. 首页可选“合计 / Codex / Claude”，突出累计总量、上行、下行和代理占比，今日用量位于累计卡片下方；可切换全部记录、今日、近 7 天、近 30 天。每日用量和去向排行随范围变化，本次会话位于底部。
 4. 点击“暂停监控”停止当前采集；再次开始创建新会话，历史累计仍保留。关闭窗口或最小化会收起到系统托盘继续运行，右键托盘选择“退出”才结束程序并保存。未运行期间的流量无法补回。
 5. “累计去向”支持搜索目标域名、IP、地区和节点；点击排行可筛选，搜索框右侧可一键清除。点击表格目标展开完整地址、进程、地区来源及代理链，可选择文字或复制全部详情。CSV 导出当前所选时间范围的去向汇总。
 
-默认包含派生工具进程和回环连接。派生工具会计入由 Codex 启动的 shell、Python、Node、MCP 等。在右上角“监控设置”里，可在停止状态取消选项，选择会保存并用于下次启动；已有历史保留当时的采集范围，不会凭空补齐过去未记录的工具流量。
+默认包含派生工具进程和回环连接。派生工具会计入由对应应用启动的 shell、Python、Node、MCP 等。在右上角“监控设置”里，可在停止状态取消选项，选择会保存并用于下次启动；已有历史保留当时的采集范围，不会凭空补齐过去未记录的工具流量。
+
+## Codex、Claude 与合计
+
+应用、日期与全部 / 代理三个范围可组合选择，统计卡片、趋势、去向、进程及 CSV 跟随应用筛选。合计等于 Codex 加 Claude，日期旁展示两款应用在同一日期和流量范围内的分项，目标和进程注明所属应用。
+
+Claude 支持 Windows 桌面版、原生 CLI、npm 原生二进制和旧 Node CLI。派生工具归属于最近的核心应用；例如 Codex 启动 Claude CLI 后，Claude 及其派生进程归 Claude，不同时计入 Codex。已有 Codex 记录按原口径保留；Claude 从新版开始采集，过去没有记录的用量无法回补。
+
+归属基于可核实的 Windows 进程。浏览器里的 claude.ai、共享 WSL 或 Cowork 虚拟机的整体流量不会凭域名或宿主名称直接归给 Claude。旧 npm Node 入口仅即时检查候选进程的启动脚本，完整命令行不写入历史或导出。
+
+## 检测更新
+
+在“监控设置”中查看当前版本并点击“检测更新”。程序异步读取本项目公开 GitHub Releases 的最新正式版本，发现新版后显示“下载新版”，点击后在浏览器打开官方 Windows x64 安装包。运行安装向导即可升级，流量历史保留。
+
+不需要自建服务器。只有手动检查时请求版本信息，不上传流量记录、进程、域名或代理节点。网络失败、超时和 GitHub 请求限制会显示可重试的原因；检查不会中断监控，也不会自动执行安装包。
 
 ## 开机自动监控
 
@@ -59,7 +73,7 @@ Windows 本地程序，累计记录 Codex 桌面端、CLI 和派生工具进程�
 
 ## 全部流量与代理流量
 
-时间范围与流量范围分别选择。默认“全部流量”；切到代理范围后，累计、今日提示、每日图、去向排行、明细及 CSV 只显示代理流量，并与同日期范围内的全部流量对比。实时速率、当前进程和历史会话仍按全部采集口径显示。
+时间范围与流量范围分别选择。默认“全部流量”；切到代理范围后，累计、今日提示、每日图、去向排行、明细及 CSV 只显示代理流量，并与同日期范围内的全部流量对比。实时速率、当前进程和历史会话跟随应用选择，仍按全部流量口径显示。
 
 全部流量 = 代理 + 已确认直连 + 未知。出站类型来自记录时的本机代理报告；明确的 `Direct` / `DIRECT` 不算代理。只有回环或虚拟 IP、但没有匹配的代理报告时属于未知，不能直接当作代理或直连。旧记录没有出站类型时，根据当时保存的非 DIRECT 节点/链路判断，并在分类依据里注明。摘要中缺少明细的流量差额也归到未知。
 
@@ -104,6 +118,8 @@ Windows 本地程序，累计记录 Codex 桌面端、CLI 和派生工具进程�
 .\dist\CodexTrafficMonitor.exe --snapshot .\output\snapshot.json
 .\dist\CodexTrafficMonitor.exe --dashboard-snapshot .\output\dashboard.json
 .\dist\CodexTrafficMonitor.exe --dashboard-snapshot .\output\proxy-dashboard.json --traffic proxy
+.\dist\CodexTrafficMonitor.exe --dashboard-snapshot .\output\claude-dashboard.json --application claude
+.\dist\CodexTrafficMonitor.exe --check-updates .\output\update-check.json
 .\dist\CodexTrafficMonitor.exe --startup-status .\output\startup-status.json
 ```
 

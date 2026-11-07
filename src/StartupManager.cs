@@ -198,7 +198,7 @@ public static class StartupManager
         XNamespace ns = "http://schemas.microsoft.com/windows/2004/02/mit/task";
         XElement E(string name, object? value) => new(ns + name, value);
         return new XDocument(new XElement(ns + "Task", new XAttribute("version", "1.2"),
-            E("RegistrationInfo", new[] { E("Author", "Codex 流量观察"), E("Description", "当前用户登录 Windows 后，在托盘后台自动记录 Codex 网络上下行；可在程序内关闭。"), E("Source", TaskSource) }),
+            E("RegistrationInfo", new[] { E("Author", "Codex 流量观察"), E("Description", "当前用户登录 Windows 后，在托盘后台自动记录 Codex / Claude 网络上下行；可在程序内关闭。"), E("Source", TaskSource) }),
             E("Triggers", E("LogonTrigger", new[] { E("Enabled", "true"), E("UserId", sid) })),
             E("Principals", new XElement(ns + "Principal", new XAttribute("id", "CurrentUser"), E("UserId", sid), E("LogonType", "InteractiveToken"), E("RunLevel", "HighestAvailable"))),
             E("Settings", new[] { E("MultipleInstancesPolicy", "IgnoreNew"), E("DisallowStartIfOnBatteries", "false"), E("StopIfGoingOnBatteries", "false"), E("AllowHardTerminate", "false"), E("StartWhenAvailable", "true"), E("RunOnlyIfNetworkAvailable", "false"), E("IdleSettings", new[] { E("StopOnIdleEnd", "false"), E("RestartOnIdle", "false") }), E("AllowStartOnDemand", "true"), E("Enabled", "true"), E("Hidden", "false"), E("RunOnlyIfIdle", "false"), E("WakeToRun", "false"), E("ExecutionTimeLimit", "PT0S"), E("Priority", "7") }),

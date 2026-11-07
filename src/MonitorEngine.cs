@@ -26,8 +26,10 @@ public sealed class MonitorEngine : IDisposable
     private string _logFile = "";
     private long _lost;
     private long _lastUp, _lastDown;
+    private long _lastCodexUp, _lastCodexDown, _lastClaudeUp, _lastClaudeDown;
     private long _lastTicks = Stopwatch.GetTimestamp();
     private double _upRate, _downRate;
+    private double _codexUpRate, _codexDownRate, _claudeUpRate, _claudeDownRate;
     private int _maintenanceActive;
     private int _disposeStarted;
     private List<ConnectionInfo> _connections = new();
@@ -79,14 +81,16 @@ public sealed class MonitorEngine : IDisposable
                 _ledger = new TrafficLedger();
                 _startedAt = DateTime.Now;
                 _lastUp = _lastDown = _lost = 0;
+                _lastCodexUp = _lastCodexDown = _lastClaudeUp = _lastClaudeDown = 0;
                 _lastTicks = Stopwatch.GetTimestamp();
                 _upRate = _downRate = 0;
+                _codexUpRate = _codexDownRate = _claudeUpRate = _claudeDownRate = 0;
             }
             // Source starts a user-provider session if accessed first. Kernel must be
             // enabled before touching Source, or TraceEvent rejects this session.
             session.EnableKernelProvider(KernelTraceEventParser.Keywords.NetworkTCPIP | KernelTraceEventParser.Keywords.Process);
             var parser = session.Source.Kernel;
-            parser.ProcessStart += d => _catalog.RecordStarted(d.ProcessID, d.ParentID, d.ImageFileName, d.TimeStamp);
+            parser.ProcessStart += d => _catalog.RecordStarted(d.ProcessID, d.ParentID, d.ImageFileName, d.TimeStamp, executablePath: null, commandLine: d.CommandLine);
             parser.ProcessStop += d => _catalog.RecordStopped(d.ProcessID, d.TimeStamp);
             parser.TcpIpSend += d => Transfer(d.TimeStamp, d.ProcessID, "TCP", true, d.saddr, d.sport, d.daddr, d.dport, d.size);
             parser.TcpIpRecv += d => Transfer(d.TimeStamp, d.ProcessID, "TCP", false, d.saddr, d.sport, d.daddr, d.dport, d.size);
@@ -113,16 +117,17 @@ public sealed class MonitorEngine : IDisposable
                 _running = _desired = false;
                 _session = null;
                 _upRate = _downRate = 0;
+                _codexUpRate = _codexDownRate = _claudeUpRate = _claudeDownRate = 0;
                 try
                 {
                     Flush();
-                    _store?.Update(_ledger.UploadBytes, _ledger.DownloadBytes, _lost, _error.Length > 0 ? _error : null, true);
+                    UpdateStore(_error.Length > 0 ? _error : null, true);
                 }
                 catch (Exception e) { _error = "保存记录失败：" + e.Message; }
                 finally
                 {
                     if (_error.Length > 0)
-                        try { _store?.Update(_ledger.UploadBytes, _ledger.DownloadBytes, _lost, _error, true); } catch { }
+                        try { UpdateStore(_error, true); } catch { }
                     try { _store?.Dispose(); } catch (Exception e) { _error = "关闭记录失败：" + e.Message; }
                 }
                 _store = null;
@@ -154,7 +159,7 @@ public sealed class MonitorEngine : IDisposable
                 remote = endpoints.RemoteAddress; remotePort = endpoints.RemotePort;
             }
             if (!IncludeLoopback && IPAddress.TryParse(remote, out var ip) && IPAddress.IsLoopback(ip)) return;
-            _ledger.Add(at, pid, process.Name, process.Path, process.Kind, protocol, local, localPort, remote, remotePort, bytes, upload);
+            _ledger.Add(at, pid, process.Name, process.Path, process.Kind, protocol, local, localPort, remote, remotePort, bytes, upload, process.Application);
         }
     }
 
@@ -180,6 +185,12 @@ public sealed class MonitorEngine : IDisposable
                 double elapsed = (now - _lastTicks) / (double)Stopwatch.Frequency;
                 _upRate = _running && elapsed > 0 ? (_ledger.UploadBytes - _lastUp) / elapsed : 0;
                 _downRate = _running && elapsed > 0 ? (_ledger.DownloadBytes - _lastDown) / elapsed : 0;
+                _codexUpRate = _running && elapsed > 0 ? (_ledger.CodexUploadBytes - _lastCodexUp) / elapsed : 0;
+                _codexDownRate = _running && elapsed > 0 ? (_ledger.CodexDownloadBytes - _lastCodexDown) / elapsed : 0;
+                _claudeUpRate = _running && elapsed > 0 ? (_ledger.ClaudeUploadBytes - _lastClaudeUp) / elapsed : 0;
+                _claudeDownRate = _running && elapsed > 0 ? (_ledger.ClaudeDownloadBytes - _lastClaudeDown) / elapsed : 0;
+                _lastCodexUp = _ledger.CodexUploadBytes; _lastCodexDown = _ledger.CodexDownloadBytes;
+                _lastClaudeUp = _ledger.ClaudeUploadBytes; _lastClaudeDown = _ledger.ClaudeDownloadBytes;
                 _lastUp = _ledger.UploadBytes; _lastDown = _ledger.DownloadBytes; _lastTicks = now;
                 if (_running)
                 {
@@ -219,19 +230,24 @@ public sealed class MonitorEngine : IDisposable
         }
         _store.Append(pending);
         _ledger.CommitPending();
-        _store.Update(_ledger.UploadBytes, _ledger.DownloadBytes, _lost);
+        UpdateStore();
     }
 
-    public MonitorSnapshot GetSnapshot(bool includeTargets = true)
+    private void UpdateStore(string? error = null, bool ended = false) => _store?.Update(
+        _ledger.UploadBytes, _ledger.DownloadBytes, _lost, error, ended,
+        _ledger.CodexUploadBytes, _ledger.CodexDownloadBytes, _ledger.ClaudeUploadBytes, _ledger.ClaudeDownloadBytes);
+
+    public MonitorSnapshot GetSnapshot(bool includeTargets = true, DashboardApplicationScope applicationScope = DashboardApplicationScope.Total)
     {
-        var tracked = _catalog.List(IncludeChildren);
+        var tracked = _catalog.List(IncludeChildren).Where(p => ApplicationFilter.Matches(p.Application, applicationScope)).ToList();
+        var trackedIds = tracked.Select(p => p.Pid).ToHashSet();
         lock (_gate)
         {
-            var targets = includeTargets ? _ledger.Targets() : new List<TargetRow>();
+            var targets = includeTargets ? _ledger.Targets(applicationScope) : new List<TargetRow>();
             if (includeTargets && _startedAt == null)
-                targets = _connections.Where(c => _catalog.IsTracked(c.Pid, IncludeChildren) && c.RemotePort != 0 && (IncludeLoopback || !IPAddress.IsLoopback(IPAddress.Parse(c.RemoteAddress))))
-                    .Select(c => new TargetRow { Address = c.RemoteAddress, Port = c.RemotePort, LocalAddress = c.LocalAddress, LocalPort = c.LocalPort, Target = AddressClassifier.Endpoint(c.RemoteAddress, c.RemotePort), Process = _catalog.Get(c.Pid)?.Name ?? "未知", Pid = c.Pid, Protocol = c.Protocol, Route = AddressClassifier.Classify(IPAddress.Parse(c.RemoteAddress)) }).ToList();
-            var processes = _ledger.Processes();
+                targets = _connections.Where(c => trackedIds.Contains(c.Pid) && c.RemotePort != 0 && (IncludeLoopback || !IPAddress.IsLoopback(IPAddress.Parse(c.RemoteAddress))))
+                    .Select(c => new TargetRow { Application = _catalog.Get(c.Pid)?.Application ?? TrackedApplication.Codex, Address = c.RemoteAddress, Port = c.RemotePort, LocalAddress = c.LocalAddress, LocalPort = c.LocalPort, Target = AddressClassifier.Endpoint(c.RemoteAddress, c.RemotePort), Process = _catalog.Get(c.Pid)?.Name ?? "未知", Pid = c.Pid, Protocol = c.Protocol, Route = AddressClassifier.Classify(IPAddress.Parse(c.RemoteAddress)) }).ToList();
+            var processes = _ledger.Processes(applicationScope);
             foreach (var target in targets)
             {
                 if (!string.IsNullOrEmpty(target.Hostname)) continue;
@@ -251,18 +267,31 @@ public sealed class MonitorEngine : IDisposable
             }
             foreach (var target in targets) { _geo.Enrich(target); TrafficClassifier.Apply(target); }
             foreach (var p in tracked)
-                if (!processes.Any(x => x.Pid == p.Pid)) processes.Add(new ProcessRow { Name = p.Name, Pid = p.Pid, Kind = p.Kind });
-            var sessions = _history.ToList();
+                if (!processes.Any(x => x.Pid == p.Pid && x.Application == p.Application)) processes.Add(new ProcessRow { Application = p.Application, Name = p.Name, Pid = p.Pid, Kind = p.Kind });
+            var sessions = _history.Select(row => SelectSession(row, applicationScope))
+                .Where(row => applicationScope == DashboardApplicationScope.Total || row.UploadBytes > 0 || row.DownloadBytes > 0).ToList();
             if (_store != null)
-                sessions.Insert(0, new SessionRow { StartedAt = _store.Record.StartedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"), Duration = (DateTime.UtcNow - _store.Record.StartedUtc).ToString(@"hh\:mm\:ss") + "（本次）", UploadBytes = _ledger.UploadBytes, DownloadBytes = _ledger.DownloadBytes, Path = _store.DirectoryPath });
+                sessions.Insert(0, SelectSession(new SessionRow { AccountingVersion = 2,
+                    CodexUploadBytes = _ledger.CodexUploadBytes, CodexDownloadBytes = _ledger.CodexDownloadBytes,
+                    ClaudeUploadBytes = _ledger.ClaudeUploadBytes, ClaudeDownloadBytes = _ledger.ClaudeDownloadBytes,
+                    StartedAt = _store.Record.StartedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"), Duration = (DateTime.UtcNow - _store.Record.StartedUtc).ToString(@"hh\:mm\:ss") + "（本次）", UploadBytes = _ledger.UploadBytes, DownloadBytes = _ledger.DownloadBytes, Path = _store.DirectoryPath }, applicationScope));
+            var totals = _ledger.Totals(applicationScope);
+            var rates = applicationScope switch
+            {
+                DashboardApplicationScope.Codex => (_codexUpRate, _codexDownRate),
+                DashboardApplicationScope.Claude => (_claudeUpRate, _claudeDownRate),
+                _ => (_upRate, _downRate)
+            };
             return new MonitorSnapshot
             {
-                CapturedAt = DateTime.Now, StartedAt = _startedAt, UploadBytes = _ledger.UploadBytes, DownloadBytes = _ledger.DownloadBytes,
-                UploadBytesPerSecond = _upRate, DownloadBytesPerSecond = _downRate, ProcessCount = tracked.Count,
-                ConnectionCount = _connections.Count(c => _catalog.IsTracked(c.Pid, IncludeChildren) && c.RemotePort != 0), EventsLost = _lost,
+                ApplicationScope = applicationScope, CodexUploadBytes = _ledger.CodexUploadBytes, CodexDownloadBytes = _ledger.CodexDownloadBytes,
+                ClaudeUploadBytes = _ledger.ClaudeUploadBytes, ClaudeDownloadBytes = _ledger.ClaudeDownloadBytes,
+                CapturedAt = DateTime.Now, StartedAt = _startedAt, UploadBytes = totals.Upload, DownloadBytes = totals.Download,
+                UploadBytesPerSecond = rates.Item1, DownloadBytesPerSecond = rates.Item2, ProcessCount = tracked.Count,
+                ConnectionCount = _connections.Count(c => trackedIds.Contains(c.Pid) && c.RemotePort != 0), EventsLost = _lost,
                 HasCapturedData = _startedAt.HasValue, Targets = targets, Processes = processes.OrderByDescending(x => x.UploadBytes + x.DownloadBytes).ToList(), Sessions = sessions,
                 CaptureStatus = _running ? "正在记录" : _desired ? "正在启动" : _startedAt.HasValue ? "已停止记录" : "连接查看 · 未计量",
-                Warning = _lost > 0 ? $"ETW 丢失 {_lost:N0} 个事件，统计可能偏低。" : "记录 Codex 进程的直接网络连接；回环可能是本地代理，虚拟地址无法还原最终网站。", LogFile = _logFile
+                Warning = _lost > 0 ? $"ETW 丢失 {_lost:N0} 个事件，统计可能偏低。" : "记录 Codex / Claude 进程的直接网络连接；回环可能是本地代理，虚拟地址无法还原最终网站。", LogFile = _logFile
             };
         }
     }
@@ -276,16 +305,25 @@ public sealed class MonitorEngine : IDisposable
         }
     }
 
-    public DashboardSnapshot GetDashboardSnapshot(DashboardRange range, DashboardTrafficScope scope = DashboardTrafficScope.All)
+    private static SessionRow SelectSession(SessionRow row, DashboardApplicationScope scope) => new()
     {
-        var snapshot = _analytics.GetSnapshot(range, scope);
+        AccountingVersion = row.AccountingVersion, CodexUploadBytes = row.CodexUploadBytes, CodexDownloadBytes = row.CodexDownloadBytes,
+        ClaudeUploadBytes = row.ClaudeUploadBytes, ClaudeDownloadBytes = row.ClaudeDownloadBytes,
+        StartedAt = row.StartedAt, Duration = row.Duration, Path = row.Path,
+        UploadBytes = scope == DashboardApplicationScope.Codex ? row.CodexUploadBytes : scope == DashboardApplicationScope.Claude ? row.ClaudeUploadBytes : row.UploadBytes,
+        DownloadBytes = scope == DashboardApplicationScope.Codex ? row.CodexDownloadBytes : scope == DashboardApplicationScope.Claude ? row.ClaudeDownloadBytes : row.DownloadBytes
+    };
+
+    public DashboardSnapshot GetDashboardSnapshot(DashboardRange range, DashboardTrafficScope scope = DashboardTrafficScope.All, DashboardApplicationScope applicationScope = DashboardApplicationScope.Total)
+    {
+        var snapshot = _analytics.GetSnapshot(range, scope, applicationScope);
         foreach (var target in snapshot.Targets) _geo.Enrich(target);
         return snapshot;
     }
 
-    public void ExportDashboardCsv(string path, DashboardRange range, DashboardTrafficScope scope = DashboardTrafficScope.All)
+    public void ExportDashboardCsv(string path, DashboardRange range, DashboardTrafficScope scope = DashboardTrafficScope.All, DashboardApplicationScope applicationScope = DashboardApplicationScope.Total)
     {
-        var snapshot = GetDashboardSnapshot(range, scope);
+        var snapshot = GetDashboardSnapshot(range, scope, applicationScope);
         if (snapshot.IsLoading) throw new InvalidOperationException("历史记录正在载入，请稍后导出。");
         if (!snapshot.HasRecords) throw new InvalidOperationException("当前范围内还没有流量记录。");
         SessionStore.WriteCsv(path, snapshot.Targets);

@@ -19,9 +19,12 @@ public sealed class HistoryAnalytics
     private DateTime _publishedDay;
     private bool _needsPublish = true;
     private string _directoryWarning = "";
-    private IReadOnlyDictionary<(DashboardRange Range, DashboardTrafficScope Scope), DashboardSnapshot> _published = Enum.GetValues<DashboardRange>()
+    private IReadOnlyDictionary<(DashboardRange Range, DashboardTrafficScope Scope), PublishedSnapshot> _published = Enum.GetValues<DashboardRange>()
         .SelectMany(range => Enum.GetValues<DashboardTrafficScope>().Select(scope => (range, scope)))
-        .ToDictionary(key => key, key => new DashboardSnapshot { Range = key.range, TrafficScope = key.scope, IsLoading = true });
+        .ToDictionary(key => key, key => new PublishedSnapshot(
+            new DashboardSnapshot { Range = key.range, TrafficScope = key.scope, IsLoading = true },
+            new DashboardSnapshot { Range = key.range, TrafficScope = key.scope, IsLoading = true },
+            new DashboardSnapshot { Range = key.range, TrafficScope = key.scope, IsLoading = true }));
 
     public HistoryAnalytics(string dataDirectory, Func<DateTime>? utcNow = null)
     {
@@ -78,15 +81,31 @@ public sealed class HistoryAnalytics
         }
     }
 
-    public DashboardSnapshot GetSnapshot(DashboardRange range, DashboardTrafficScope scope = DashboardTrafficScope.All)
+    public DashboardSnapshot GetSnapshot(DashboardRange range, DashboardTrafficScope scope = DashboardTrafficScope.All,
+        DashboardApplicationScope applicationScope = DashboardApplicationScope.Total)
     {
         var published = Volatile.Read(ref _published);
-        if (!published.TryGetValue((range, scope), out var saved)) saved = published[(DashboardRange.All, DashboardTrafficScope.All)];
+        if (!published.TryGetValue((range, scope), out var entry)) entry = published[(DashboardRange.All, DashboardTrafficScope.All)];
+        if (!Enum.IsDefined(applicationScope)) applicationScope = DashboardApplicationScope.Total;
+        var saved = applicationScope switch
+        {
+            DashboardApplicationScope.Codex => entry.Codex,
+            DashboardApplicationScope.Claude => entry.Claude,
+            _ => entry.Total
+        };
+        // Application slices retain only scalar/daily summaries. The eight total
+        // snapshots own the aggregate target rows; no threefold target cache is
+        // retained, and UI queries never take the file-indexing lock.
+        var targets = entry.Total.Targets.Where(t => applicationScope == DashboardApplicationScope.Total ||
+            t.Application == (applicationScope == DashboardApplicationScope.Claude ? TrackedApplication.Claude : TrackedApplication.Codex));
         // Protect the index and other windows from callers modifying data-bound rows.
         return new DashboardSnapshot
         {
-            Range = saved.Range, TrafficScope = saved.TrafficScope, FromUtc = saved.FromUtc, ToUtc = saved.IsLoading ? saved.ToUtc : _utcNow(), FirstRecordedUtc = saved.FirstRecordedUtc,
+            Range = saved.Range, TrafficScope = saved.TrafficScope, ApplicationScope = applicationScope,
+            FromUtc = saved.FromUtc, ToUtc = saved.IsLoading ? saved.ToUtc : _utcNow(), FirstRecordedUtc = saved.FirstRecordedUtc,
             UploadBytes = saved.UploadBytes, DownloadBytes = saved.DownloadBytes,
+            CodexUploadBytes = entry.Codex.UploadBytes, CodexDownloadBytes = entry.Codex.DownloadBytes,
+            ClaudeUploadBytes = entry.Claude.UploadBytes, ClaudeDownloadBytes = entry.Claude.DownloadBytes,
             AllUploadBytes = saved.AllUploadBytes, AllDownloadBytes = saved.AllDownloadBytes,
             ProxyUploadBytes = saved.ProxyUploadBytes, ProxyDownloadBytes = saved.ProxyDownloadBytes,
             DirectUploadBytes = saved.DirectUploadBytes, DirectDownloadBytes = saved.DirectDownloadBytes,
@@ -95,11 +114,11 @@ public sealed class HistoryAnalytics
             RecordedDays = saved.RecordedDays, SessionCount = saved.SessionCount, HasRecords = saved.HasRecords,
             IsLoading = saved.IsLoading, Warning = saved.Warning,
             DailyUsage = saved.DailyUsage.Select(d => new DailyUsageRow { Date = d.Date, UploadBytes = d.UploadBytes, DownloadBytes = d.DownloadBytes }).ToList(),
-            Targets = saved.Targets.Select(CloneTarget).ToList()
+            Targets = targets.Select(CloneTarget).ToList()
         };
     }
 
-    private DashboardSnapshot BuildSnapshot(DashboardRange range, DashboardTrafficScope scope, DateTime now)
+    private PublishedSnapshot BuildSnapshot(DashboardRange range, DashboardTrafficScope scope, DateTime now)
     {
         lock (_gate)
         {
@@ -111,12 +130,14 @@ public sealed class HistoryAnalytics
                 DashboardRange.Last30Days => today.AddDays(-29),
                 _ => null
             };
-            var snapshot = new DashboardSnapshot
+            DashboardSnapshot NewSnapshot(DashboardApplicationScope applicationScope) => new()
             {
-                Range = range, TrafficScope = scope, FromUtc = start?.ToUniversalTime(), ToUtc = now,
+                Range = range, TrafficScope = scope, ApplicationScope = applicationScope, FromUtc = start?.ToUniversalTime(), ToUtc = now,
                 IsLoading = !_loaded
             };
-            var days = new SortedDictionary<DateTime, DailyUsageRow>();
+            var snapshot = NewSnapshot(DashboardApplicationScope.Total);
+            var applications = new[] { NewSnapshot(DashboardApplicationScope.Codex), NewSnapshot(DashboardApplicationScope.Claude) };
+            var days = new[] { new SortedDictionary<DateTime, DailyUsageRow>(), new SortedDictionary<DateTime, DailyUsageRow>() };
             var targets = new Dictionary<TargetKey, TargetRow>();
             int malformedRows = 0, malformedSessions = 0, metadataErrors = 0, flowErrors = 0;
             int inconsistentSessions = 0, unallocatedSessions = 0, partialTails = 0, lostSessions = 0;
@@ -138,36 +159,59 @@ public sealed class HistoryAnalytics
 
                 bool validSession = record != null || index.ValidLines > 0;
                 bool hasSelectedDay = index.Days.Any(d => InRange(d.Key, start, today) &&
-                    (scope == DashboardTrafficScope.All || d.Value.Targets.Values.Any(t => t.TrafficKind == TrafficKind.Proxy)));
+                    (scope == DashboardTrafficScope.All || d.Value.Applications.Any(a => a.ProxyRows > 0)));
                 bool overlaps = record != null && AsUtc(record.StartedUtc).ToLocalTime().Date <= today &&
                     (start == null || AsUtc(record.EndedUtc ?? record.UpdatedUtc).ToLocalTime().Date >= start);
                 if (validSession && (hasSelectedDay || scope == DashboardTrafficScope.All && (overlaps || range == DashboardRange.All))) snapshot.SessionCount++;
                 snapshot.HasRecords |= validSession;
 
-                long selectedUp = 0, selectedDown = 0;
+                bool missingDetail = false, mismatch = false;
+                for (int app = 0; app < applications.Length; app++)
+                {
+                    var appSnapshot = applications[app];
+                    var appIndex = index.Applications[app];
+                    long summaryUp = SummaryUpload(record, app), summaryDown = SummaryDownload(record, app);
+                    bool validApplication = appIndex.ValidLines > 0 || summaryUp > 0 || summaryDown > 0 || app == 0 && record is { AccountingVersion: < 2 };
+                    appSnapshot.HasRecords |= validApplication;
+                    DateTime? applicationFirst = appIndex.FirstTimestampUtc;
+                    if (validApplication && record != null && (applicationFirst == null || app == 0 && record.AccountingVersion < 2))
+                    {
+                        DateTime began = AsUtc(record.StartedUtc);
+                        if (applicationFirst == null || began < applicationFirst) applicationFirst = began;
+                    }
+                    if (applicationFirst != null && (appSnapshot.FirstRecordedUtc == null || applicationFirst < appSnapshot.FirstRecordedUtc))
+                        appSnapshot.FirstRecordedUtc = applicationFirst;
+                    bool appHasSelectedDay = index.Days.Any(d => InRange(d.Key, start, today) &&
+                        (scope == DashboardTrafficScope.All ? d.Value.Applications[app].Rows > 0 : d.Value.Applications[app].ProxyRows > 0));
+                    if (validApplication && (appHasSelectedDay || scope == DashboardTrafficScope.All && (overlaps || range == DashboardRange.All)))
+                        appSnapshot.SessionCount++;
+                    long canonicalUp = Math.Max(appIndex.Upload, summaryUp), canonicalDown = Math.Max(appIndex.Download, summaryDown);
+                    missingDetail |= canonicalUp > appIndex.Upload || canonicalDown > appIndex.Download;
+                    mismatch |= record != null && (summaryUp != appIndex.Upload || summaryDown != appIndex.Download);
+                    if (range == DashboardRange.All)
+                    { appSnapshot.AllUploadBytes += canonicalUp; appSnapshot.AllDownloadBytes += canonicalDown; }
+                }
                 foreach (var pair in index.Days)
                 {
-                    var scopedTargets = scope == DashboardTrafficScope.All ? pair.Value.Targets.Values.ToList()
-                        : pair.Value.Targets.Values.Where(t => t.TrafficKind == TrafficKind.Proxy).ToList();
-                    long dayUp = scope == DashboardTrafficScope.All ? pair.Value.Upload : scopedTargets.Sum(t => t.UploadBytes);
-                    long dayDown = scope == DashboardTrafficScope.All ? pair.Value.Download : scopedTargets.Sum(t => t.DownloadBytes);
-                    if (pair.Key == today)
+                    bool selectedDay = InRange(pair.Key, start, today);
+                    for (int app = 0; app < applications.Length; app++)
                     {
-                        snapshot.TodayUploadBytes += dayUp;
-                        snapshot.TodayDownloadBytes += dayDown;
+                        var appSnapshot = applications[app];
+                        var dayCounts = pair.Value.Applications[app];
+                        long dayUp = scope == DashboardTrafficScope.All ? dayCounts.Upload : dayCounts.ProxyUpload;
+                        long dayDown = scope == DashboardTrafficScope.All ? dayCounts.Download : dayCounts.ProxyDownload;
+                        if (pair.Key == today)
+                        { appSnapshot.TodayUploadBytes += dayUp; appSnapshot.TodayDownloadBytes += dayDown; }
+                        if (!selectedDay) continue;
+                        if (range != DashboardRange.All)
+                        { appSnapshot.AllUploadBytes += dayCounts.Upload; appSnapshot.AllDownloadBytes += dayCounts.Download; }
+                        appSnapshot.ProxyUploadBytes += dayCounts.ProxyUpload; appSnapshot.ProxyDownloadBytes += dayCounts.ProxyDownload;
+                        appSnapshot.DirectUploadBytes += dayCounts.DirectUpload; appSnapshot.DirectDownloadBytes += dayCounts.DirectDownload;
+                        if (scope == DashboardTrafficScope.All ? dayCounts.Rows == 0 : dayCounts.ProxyRows == 0) continue;
+                        if (!days[app].TryGetValue(pair.Key, out var day)) days[app][pair.Key] = day = new DailyUsageRow { Date = pair.Key };
+                        day.UploadBytes += dayUp; day.DownloadBytes += dayDown;
                     }
-                    if (!InRange(pair.Key, start, today)) continue;
-                    selectedUp += pair.Value.Upload; selectedDown += pair.Value.Download;
-                    foreach (var target in pair.Value.Targets)
-                    {
-                        if (target.Value.TrafficKind == TrafficKind.Proxy)
-                        { snapshot.ProxyUploadBytes += target.Value.UploadBytes; snapshot.ProxyDownloadBytes += target.Value.DownloadBytes; }
-                        else if (target.Value.TrafficKind == TrafficKind.Direct)
-                        { snapshot.DirectUploadBytes += target.Value.UploadBytes; snapshot.DirectDownloadBytes += target.Value.DownloadBytes; }
-                    }
-                    if (scope == DashboardTrafficScope.Proxy && scopedTargets.Count == 0) continue;
-                    if (!days.TryGetValue(pair.Key, out var day)) days[pair.Key] = day = new DailyUsageRow { Date = pair.Key };
-                    day.UploadBytes += dayUp; day.DownloadBytes += dayDown;
+                    if (!selectedDay) continue;
                     foreach (var target in pair.Value.Targets)
                     {
                         if (scope == DashboardTrafficScope.Proxy && target.Value.TrafficKind != TrafficKind.Proxy) continue;
@@ -176,23 +220,32 @@ public sealed class HistoryAnalytics
                     }
                 }
 
-                // session.json is the canonical session counter. If some detail is
-                // unreadable it can rescue the all-time number, but we cannot invent
-                // the missing day, direction's destination, or process attribution.
-                long canonicalUp = Math.Max(index.Upload, Math.Max(0, record?.UploadBytes ?? 0));
-                long canonicalDown = Math.Max(index.Download, Math.Max(0, record?.DownloadBytes ?? 0));
-                bool mismatch = record != null && (record.UploadBytes != index.Upload || record.DownloadBytes != index.Download);
+                // Missing canonical detail retains its recorded application but
+                // never gains an invented date, destination or proxy classification.
                 if (mismatch) inconsistentSessions++;
-                if (canonicalUp > index.Upload || canonicalDown > index.Download) unallocatedSessions++;
-                snapshot.AllUploadBytes += range == DashboardRange.All ? canonicalUp : selectedUp;
-                snapshot.AllDownloadBytes += range == DashboardRange.All ? canonicalDown : selectedDown;
+                if (missingDetail) unallocatedSessions++;
+            }
+            for (int app = 0; app < applications.Length; app++)
+            {
+                var appSnapshot = applications[app];
+                appSnapshot.UnknownUploadBytes = appSnapshot.AllUploadBytes - appSnapshot.ProxyUploadBytes - appSnapshot.DirectUploadBytes;
+                appSnapshot.UnknownDownloadBytes = appSnapshot.AllDownloadBytes - appSnapshot.ProxyDownloadBytes - appSnapshot.DirectDownloadBytes;
+                appSnapshot.UploadBytes = scope == DashboardTrafficScope.Proxy ? appSnapshot.ProxyUploadBytes : appSnapshot.AllUploadBytes;
+                appSnapshot.DownloadBytes = scope == DashboardTrafficScope.Proxy ? appSnapshot.ProxyDownloadBytes : appSnapshot.AllDownloadBytes;
+                appSnapshot.RecordedDays = days[app].Count;
+                appSnapshot.DailyUsage = days[app].Values.ToList();
+                snapshot.AllUploadBytes += appSnapshot.AllUploadBytes; snapshot.AllDownloadBytes += appSnapshot.AllDownloadBytes;
+                snapshot.ProxyUploadBytes += appSnapshot.ProxyUploadBytes; snapshot.ProxyDownloadBytes += appSnapshot.ProxyDownloadBytes;
+                snapshot.DirectUploadBytes += appSnapshot.DirectUploadBytes; snapshot.DirectDownloadBytes += appSnapshot.DirectDownloadBytes;
+                snapshot.TodayUploadBytes += appSnapshot.TodayUploadBytes; snapshot.TodayDownloadBytes += appSnapshot.TodayDownloadBytes;
             }
             snapshot.UnknownUploadBytes = snapshot.AllUploadBytes - snapshot.ProxyUploadBytes - snapshot.DirectUploadBytes;
             snapshot.UnknownDownloadBytes = snapshot.AllDownloadBytes - snapshot.ProxyDownloadBytes - snapshot.DirectDownloadBytes;
             snapshot.UploadBytes = scope == DashboardTrafficScope.Proxy ? snapshot.ProxyUploadBytes : snapshot.AllUploadBytes;
             snapshot.DownloadBytes = scope == DashboardTrafficScope.Proxy ? snapshot.ProxyDownloadBytes : snapshot.AllDownloadBytes;
-            snapshot.RecordedDays = days.Count;
-            snapshot.DailyUsage = days.Values.ToList();
+            snapshot.DailyUsage = applications.SelectMany(a => a.DailyUsage).GroupBy(d => d.Date).OrderBy(g => g.Key)
+                .Select(g => new DailyUsageRow { Date = g.Key, UploadBytes = g.Sum(d => d.UploadBytes), DownloadBytes = g.Sum(d => d.DownloadBytes) }).ToList();
+            snapshot.RecordedDays = snapshot.DailyUsage.Count;
             snapshot.Targets = targets.Values.OrderByDescending(t => (decimal)t.UploadBytes + t.DownloadBytes).ToList();
             var warnings = new List<string>();
             if (_directoryWarning.Length > 0) warnings.Add(_directoryWarning);
@@ -207,9 +260,15 @@ public sealed class HistoryAnalytics
             else if (inconsistentSessions > 0) warnings.Add($"{inconsistentSessions} 个会话的摘要与明细暂不一致，已保留较大的已记录总量。");
             if (lostSessions > 0) warnings.Add($"{lostSessions} 个历史会话曾丢失采集事件，记录可能偏低。");
             snapshot.Warning = string.Join(" ", warnings);
-            return snapshot;
+            foreach (var appSnapshot in applications) appSnapshot.Warning = snapshot.Warning;
+            return new PublishedSnapshot(snapshot, applications[0], applications[1]);
         }
     }
+
+    private static long SummaryUpload(SessionRecord? record, int application) => record == null ? 0 : record.AccountingVersion >= 2
+        ? application == 0 ? record.CodexUploadBytes : record.ClaudeUploadBytes : application == 0 ? record.UploadBytes : 0;
+    private static long SummaryDownload(SessionRecord? record, int application) => record == null ? 0 : record.AccountingVersion >= 2
+        ? application == 0 ? record.CodexDownloadBytes : record.ClaudeDownloadBytes : application == 0 ? record.DownloadBytes : 0;
 
     private static bool InRange(DateTime day, DateTime? start, DateTime today) => start == null || day <= today && day >= start;
     private static DateTime AsUtc(DateTime value) => value.Kind == DateTimeKind.Unspecified ? DateTime.SpecifyKind(value, DateTimeKind.Utc) : value.ToUniversalTime();
@@ -226,6 +285,11 @@ public sealed class HistoryAnalytics
             var record = JsonSerializer.Deserialize<SessionRecord>(stream);
             if (record == null || record.StartedUtc == default || record.UploadBytes < 0 || record.DownloadBytes < 0)
                 throw new JsonException("无效的会话摘要");
+            if (record.AccountingVersion >= 2 && (record.CodexUploadBytes < 0 || record.CodexDownloadBytes < 0 ||
+                record.ClaudeUploadBytes < 0 || record.ClaudeDownloadBytes < 0 ||
+                (decimal)record.CodexUploadBytes + record.ClaudeUploadBytes != record.UploadBytes ||
+                (decimal)record.CodexDownloadBytes + record.ClaudeDownloadBytes != record.DownloadBytes))
+                throw new JsonException("应用流量摘要与合计不一致");
             index.Record = record;
             index.MetadataLength = info.Length; index.MetadataWriteUtc = info.LastWriteTimeUtc;
             index.MetadataError = "";
@@ -307,17 +371,34 @@ public sealed class HistoryAnalytics
         try
         {
             var flow = JsonSerializer.Deserialize<FlowRecord>(bytes);
-            if (flow == null || flow.TimestampUtc == default || flow.UploadBytes < 0 || flow.DownloadBytes < 0) throw new JsonException("无效流量记录");
+            if (flow == null || flow.TimestampUtc == default || flow.UploadBytes < 0 || flow.DownloadBytes < 0 || !Enum.IsDefined(flow.Application))
+                throw new JsonException("无效流量记录");
             DateTime utc = AsUtc(flow.TimestampUtc);
             DateTime date = utc.ToLocalTime().Date;
             long newUp = checked(index.Upload + flow.UploadBytes), newDown = checked(index.Download + flow.DownloadBytes);
             if (!index.Days.TryGetValue(date, out var day)) index.Days[date] = day = new DayIndex();
-            day.Upload = checked(day.Upload + flow.UploadBytes); day.Download = checked(day.Download + flow.DownloadBytes);
             var target = ToTarget(flow, utc);
-            var key = new TargetKey(target.Process.ToLowerInvariant(), target.Protocol.ToUpperInvariant(), target.Address.ToLowerInvariant(), target.Port,
+            var key = new TargetKey(target.Application, target.Process.ToLowerInvariant(), target.Protocol.ToUpperInvariant(), target.Address.ToLowerInvariant(), target.Port,
                 target.Hostname.ToLowerInvariant(), target.ProxyDestination.ToLowerInvariant(), target.ProxyNode, target.TrafficKind, target.ProxyType.ToLowerInvariant());
+            var app = index.Applications[(int)flow.Application];
+            var dayApp = day.Applications[(int)flow.Application];
+            // Validate all sums before mutating the cached index. A rejected
+            // overflow row must not leave behind a partially added daily total.
+            _ = checked(app.Upload + flow.UploadBytes); _ = checked(app.Download + flow.DownloadBytes);
+            _ = checked(dayApp.Upload + flow.UploadBytes); _ = checked(dayApp.Download + flow.DownloadBytes);
             if (!day.Targets.TryGetValue(key, out var aggregate)) day.Targets[key] = target;
-            else MergeTarget(aggregate, target);
+            else
+            {
+                _ = checked(aggregate.UploadBytes + target.UploadBytes); _ = checked(aggregate.DownloadBytes + target.DownloadBytes);
+                MergeTarget(aggregate, target);
+            }
+            app.Upload += flow.UploadBytes; app.Download += flow.DownloadBytes; app.ValidLines++;
+            if (app.FirstTimestampUtc == null || utc < app.FirstTimestampUtc) app.FirstTimestampUtc = utc;
+            dayApp.Upload += flow.UploadBytes; dayApp.Download += flow.DownloadBytes; dayApp.Rows++;
+            if (target.TrafficKind == TrafficKind.Proxy)
+            { dayApp.ProxyUpload += flow.UploadBytes; dayApp.ProxyDownload += flow.DownloadBytes; dayApp.ProxyRows++; }
+            else if (target.TrafficKind == TrafficKind.Direct)
+            { dayApp.DirectUpload += flow.UploadBytes; dayApp.DirectDownload += flow.DownloadBytes; }
             index.Upload = newUp; index.Download = newDown; index.ValidLines++;
             if (index.FirstTimestampUtc == null || utc < index.FirstTimestampUtc) index.FirstTimestampUtc = utc;
             return true;
@@ -337,6 +418,7 @@ public sealed class HistoryAnalytics
         bool proxyReported = host.Length > 0 || destinationAddress.Length > 0;
         var target = new TargetRow
         {
+            Application = flow.Application,
             Address = address, Port = flow.RemotePort, Target = AddressClassifier.Endpoint(address, flow.RemotePort),
             Process = string.IsNullOrEmpty(flow.Process) ? "未知进程" : flow.Process, Protocol = flow.Protocol ?? "",
             Route = flow.Route ?? "", Hostname = host, DomainSource = proxyReported ? "代理报告（记录时）" : "",
@@ -352,6 +434,7 @@ public sealed class HistoryAnalytics
 
     private static TargetRow CloneTarget(TargetRow row) => new()
     {
+        Application = row.Application,
         Address = row.Address, Port = row.Port, Target = row.Target, Process = row.Process, Protocol = row.Protocol,
         Route = row.Route, Hostname = row.Hostname, DomainSource = row.DomainSource, ProxyDestination = row.ProxyDestination,
         ProxyChain = row.ProxyChain, ProxyNode = row.ProxyNode, Region = row.Region, RegionSource = row.RegionSource,
@@ -377,11 +460,24 @@ public sealed class HistoryAnalytics
         }
     }
 
-    private readonly record struct TargetKey(string Process, string Protocol, string Address, int Port, string Hostname, string ProxyDestination, string ProxyNode, TrafficKind TrafficKind, string ProxyType);
-    private readonly record struct SummaryStamp(long Upload, long Download, long Lost, DateTime Started, DateTime? Ended, DateTime UpdatedDay, string Status);
-    private sealed class DayIndex
+    private sealed record PublishedSnapshot(DashboardSnapshot Total, DashboardSnapshot Codex, DashboardSnapshot Claude);
+    private readonly record struct TargetKey(TrackedApplication Application, string Process, string Protocol, string Address, int Port, string Hostname, string ProxyDestination, string ProxyNode, TrafficKind TrafficKind, string ProxyType);
+    private readonly record struct SummaryStamp(long Upload, long Download, int AccountingVersion, long CodexUpload, long CodexDownload,
+        long ClaudeUpload, long ClaudeDownload, long Lost, DateTime Started, DateTime? Ended, DateTime UpdatedDay, string Status);
+    private sealed class ApplicationIndex
     {
         public long Upload, Download;
+        public int ValidLines;
+        public DateTime? FirstTimestampUtc;
+    }
+    private sealed class DayApplicationIndex
+    {
+        public long Upload, Download, ProxyUpload, ProxyDownload, DirectUpload, DirectDownload;
+        public int Rows, ProxyRows;
+    }
+    private sealed class DayIndex
+    {
+        public readonly DayApplicationIndex[] Applications = { new(), new() };
         public readonly Dictionary<TargetKey, TargetRow> Targets = new();
     }
     private sealed class SessionIndex
@@ -394,11 +490,13 @@ public sealed class HistoryAnalytics
         public int BadLines, ValidLines;
         public bool LastReadClosed, IncompleteClosedTail;
         public string MetadataError = "", FlowError = "";
+        public readonly ApplicationIndex[] Applications = { new(), new() };
         public readonly Dictionary<DateTime, DayIndex> Days = new();
         // UpdatedUtc changes with every heartbeat. Only its calendar day affects
         // dashboard accounting, so an idle recording need not rebuild every range.
         public (SummaryStamp Summary, long Length, long Offset, DateTime Written, bool Closed, bool Tail, string MetadataError, string FlowError, int BadLines) Stamp
-            => (new(Record?.UploadBytes ?? 0, Record?.DownloadBytes ?? 0, Record?.EventsLost ?? 0,
+            => (new(Record?.UploadBytes ?? 0, Record?.DownloadBytes ?? 0, Record?.AccountingVersion ?? 0,
+                Record?.CodexUploadBytes ?? 0, Record?.CodexDownloadBytes ?? 0, Record?.ClaudeUploadBytes ?? 0, Record?.ClaudeDownloadBytes ?? 0, Record?.EventsLost ?? 0,
                 Record?.StartedUtc ?? default, Record?.EndedUtc, Record == null ? default : AsUtc(Record.UpdatedUtc).ToLocalTime().Date, Record?.Status ?? ""),
                 SeenLength, Offset, FlowWriteUtc, LastReadClosed, IncompleteClosedTail, MetadataError, FlowError, BadLines);
         public SessionIndex(string path) => Path = path;
@@ -406,6 +504,7 @@ public sealed class HistoryAnalytics
         {
             SeenLength = -1; Offset = Upload = Download = 0; BadLines = ValidLines = 0;
             FirstTimestampUtc = null; LastReadClosed = IncompleteClosedTail = false; Days.Clear();
+            for (int app = 0; app < Applications.Length; app++) Applications[app] = new ApplicationIndex();
         }
     }
 }

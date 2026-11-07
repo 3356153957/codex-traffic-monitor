@@ -16,6 +16,12 @@ public static class Program
         try
         {
             if (args.Contains("--self-test")) return SelfTests.Run(ValueAfter(args, "--self-test"));
+            if (args.Contains("--check-updates"))
+            {
+                var result = UpdateChecker.CheckAsync().GetAwaiter().GetResult();
+                WriteJson(ValueAfter(args, "--check-updates") ?? "update-check.json", result);
+                return result.Status == UpdateCheckStatus.Error ? 1 : 0;
+            }
             // Installer helpers run before the normal UI's global instance lock.
             if (args.Contains("--maintenance"))
                 return InstallerIntegration.Run(ValueAfter(args, "--maintenance"), ValueAfter(args, "--install-path"), ValueAfter(args, "--state"));
@@ -32,7 +38,7 @@ public static class Program
                 history.Refresh();
                 var range = ValueAfter(args, "--range") switch { "today" => DashboardRange.Today, "7d" => DashboardRange.Last7Days, "30d" => DashboardRange.Last30Days, _ => DashboardRange.All };
                 var trafficScope = ValueAfter(args, "--traffic") == "proxy" ? DashboardTrafficScope.Proxy : DashboardTrafficScope.All;
-                var dashboard = history.GetSnapshot(range, trafficScope);
+                var dashboard = history.GetSnapshot(range, trafficScope, ApplicationScopeFromArgs(args));
                 using var geo = new GeoIpHints();
                 foreach (var target in dashboard.Targets) geo.Enrich(target);
                 WriteJson(ValueAfter(args, "--dashboard-snapshot") ?? "dashboard.json", dashboard);
@@ -42,7 +48,7 @@ public static class Program
             {
                 using var engine = new MonitorEngine();
                 Thread.Sleep(1800);
-                WriteJson(ValueAfter(args, "--snapshot") ?? "snapshot.json", engine.GetSnapshot());
+                WriteJson(ValueAfter(args, "--snapshot") ?? "snapshot.json", engine.GetSnapshot(applicationScope: ApplicationScopeFromArgs(args)));
                 return 0;
             }
             if (args.Contains("--capture-probe")) return CaptureProbe(args);
@@ -83,11 +89,19 @@ public static class Program
             string directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexTrafficMonitor");
             Directory.CreateDirectory(directory);
             File.AppendAllText(Path.Combine(directory, "errors.log"), DateTime.Now.ToString("O") + " " + e + Environment.NewLine);
-            if (!args.Any(x => x.StartsWith("--self-test") || x.StartsWith("--capture-probe") || x.StartsWith("--snapshot") || x.StartsWith("--configure-startup") || x.StartsWith("--startup-status") || x.StartsWith("--dashboard-snapshot") || x.StartsWith("--maintenance")))
+            if (!args.Any(x => x.StartsWith("--self-test") || x.StartsWith("--capture-probe") || x.StartsWith("--snapshot") || x.StartsWith("--configure-startup") || x.StartsWith("--startup-status") || x.StartsWith("--dashboard-snapshot") || x.StartsWith("--maintenance") || x.StartsWith("--check-updates")))
                 MessageBox.Show(e.Message, "Codex 流量观察", MessageBoxButton.OK, MessageBoxImage.Error);
             return 1;
         }
     }
+
+    private static DashboardApplicationScope ApplicationScopeFromArgs(string[] args) => ValueAfter(args, "--application") switch
+    {
+        null or "total" => DashboardApplicationScope.Total,
+        "codex" => DashboardApplicationScope.Codex,
+        "claude" => DashboardApplicationScope.Claude,
+        _ => throw new ArgumentException("--application 需要 total、codex 或 claude。")
+    };
 
     public static bool RelaunchElevated(bool includeChildren = false, bool includeLoopback = true)
     {

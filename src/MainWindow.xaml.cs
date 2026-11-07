@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -29,6 +30,10 @@ public partial class MainWindow : Window
     private DashboardSnapshot? _dashboard;
     private DashboardRange _range = DashboardRange.All;
     private DashboardTrafficScope _trafficScope = DashboardTrafficScope.All;
+    private DashboardApplicationScope _applicationScope = DashboardApplicationScope.Total;
+    private readonly CancellationTokenSource _updateCancellation = new();
+    private UpdateCheckResult? _availableUpdate;
+    private bool _checkingUpdate;
     private readonly Dictionary<string, (string Property, ListSortDirection Direction)> _sorts = new()
     {
         ["TargetsGrid"] = ("TotalBytes", ListSortDirection.Descending),
@@ -57,6 +62,7 @@ public partial class MainWindow : Window
         _engine = engine;
         _demo = demo;
         InitializeComponent();
+        CurrentVersionText.Text = "当前 v" + UpdateChecker.CurrentVersion;
         if (demo)
         {
             WindowStyle = WindowStyle.None;
@@ -118,19 +124,20 @@ public partial class MainWindow : Window
         }
         try
         {
-            _snapshot = _demo ? CreateDemoSnapshot() : _engine.GetSnapshot(includeTargets: false);
-            _dashboard = _demo ? CreateDemoDashboard(_range, _trafficScope) : _engine.GetDashboardSnapshot(_range, _trafficScope);
+            _snapshot = _demo ? CreateDemoSnapshot(_applicationScope) : _engine.GetSnapshot(includeTargets: false, applicationScope: _applicationScope);
+            _dashboard = _demo ? CreateDemoDashboard(_range, _trafficScope, _applicationScope) : _engine.GetDashboardSnapshot(_range, _trafficScope, _applicationScope);
             var current = _snapshot;
             var summary = _dashboard;
             UpdateRangeButtons();
             UpdateTrafficScopeButtons();
+            UpdateApplicationScopeButtons();
             bool running = _demo || _engine.IsRunning;
             bool waiting = summary.IsLoading;
             long total = summary.UploadBytes + summary.DownloadBytes;
             ExportButton.IsEnabled = !_demo && summary.HasRecords && !waiting;
             ExportButton.Content = "导出" + TrafficScopeLabel(_trafficScope) + " CSV";
-            ExportButton.ToolTip = RangeLabel(_range) + " · " + TrafficScopeLabel(_trafficScope) + " · 导出完整去向，不受搜索文字影响";
-            TotalTitleText.Text = _trafficScope == DashboardTrafficScope.Proxy ? (_range == DashboardRange.All ? "累计代理流量" : RangeLabel(_range) + "代理流量") : _range == DashboardRange.All ? "累计总流量" : RangeLabel(_range) + "总流量";
+            ExportButton.ToolTip = ApplicationScopeLabel(_applicationScope) + " · " + RangeLabel(_range) + " · " + TrafficScopeLabel(_trafficScope) + " · 导出完整去向，不受搜索文字影响";
+            TotalTitleText.Text = ApplicationScopeLabel(_applicationScope) + " · " + (_trafficScope == DashboardTrafficScope.Proxy ? (_range == DashboardRange.All ? "累计代理流量" : RangeLabel(_range) + "代理流量") : _range == DashboardRange.All ? "累计总流量" : RangeLabel(_range) + "总流量");
             TotalText.Text = waiting ? "…" : Bytes(total);
             UploadTotalText.Text = waiting ? "…" : Bytes(summary.UploadBytes);
             DownloadTotalText.Text = waiting ? "…" : Bytes(summary.DownloadBytes);
@@ -146,12 +153,14 @@ public partial class MainWindow : Window
             UploadShareText.Text = total > 0 ? "占所选范围 " + (summary.UploadBytes * 100d / total).ToString("0.0", CultureInfo.InvariantCulture) + "%" : "发送至目标的流量";
             DownloadShareText.Text = total > 0 ? "占所选范围 " + (summary.DownloadBytes * 100d / total).ToString("0.0", CultureInfo.InvariantCulture) + "%" : "从目标接收的流量";
             TotalHintText.Text = waiting ? "正在读取本机历史记录" : "今日 " + Bytes(summary.TodayUploadBytes + summary.TodayDownloadBytes) + " · 已记录 " + summary.RecordedDays + " 天";
-            TotalHintText.ToolTip = TrafficScopeLabel(_trafficScope) + " · " + (summary.FirstRecordedUtc.HasValue ? "自 " + summary.FirstRecordedUtc.Value.ToLocalTime().ToString("yyyy/MM/dd") + " 开始记录" : "开始监控后持续累计，重启保留记录") + "\n" + summary.SessionCount + " 次监控 · 仅包含已监控时段，不代表全天覆盖。";
-            ScopeText.Text = RangeLabel(_range) + " · " + (summary.FromUtc.HasValue ? summary.FromUtc.Value.ToLocalTime().ToString("MM/dd") + " – " + summary.ToUtc.ToLocalTime().ToString("MM/dd") : "从首次记录至今");
+            TotalHintText.ToolTip = ApplicationScopeLabel(_applicationScope) + " · " + TrafficScopeLabel(_trafficScope) + " · " + (summary.FirstRecordedUtc.HasValue ? "自 " + summary.FirstRecordedUtc.Value.ToLocalTime().ToString("yyyy/MM/dd") + " 开始记录" : "开始监控后持续累计，重启保留记录") + "\n" + summary.SessionCount + " 次监控 · 仅包含已监控时段，不代表全天覆盖。";
+            ScopeText.Text = waiting ? "正在汇总应用用量…" : "Codex " + Bytes(summary.CodexUploadBytes + summary.CodexDownloadBytes) + " · Claude " + Bytes(summary.ClaudeUploadBytes + summary.ClaudeDownloadBytes);
+            ScopeText.ToolTip = RangeLabel(_range) + " · " + TrafficScopeLabel(_trafficScope) + " · " + (summary.FromUtc.HasValue ? summary.FromUtc.Value.ToLocalTime().ToString("MM/dd") + " – " + summary.ToUtc.ToLocalTime().ToString("MM/dd") : "从首次记录至今") + "\nCodex 上行 " + Bytes(summary.CodexUploadBytes) + " / 下行 " + Bytes(summary.CodexDownloadBytes) + "\nClaude 上行 " + Bytes(summary.ClaudeUploadBytes) + " / 下行 " + Bytes(summary.ClaudeDownloadBytes);
             UploadRateText.Text = current.HasCapturedData ? "↑ " + Bytes(current.UploadBytesPerSecond) + "/s" : "↑ 尚未采集";
             DownloadRateText.Text = current.HasCapturedData ? "↓ " + Bytes(current.DownloadBytesPerSecond) + "/s" : "↓ 尚未采集";
-            ProcessHintText.Text = current.ProcessCount + " 个 Codex 进程 · " + current.ConnectionCount + " 个连接";
-            OptionsSummaryText.Text = (ChildrenCheck.IsChecked == true ? "派生工具已计入" : "仅 Codex 核心进程") + (_startupEnabled ? " · 自动启动已开启" : "");
+            RealtimeScopeText.Text = "实时 · " + ApplicationScopeLabel(_applicationScope) + " · 全部流量";
+            ProcessHintText.Text = current.ProcessCount + " 个进程 · " + current.ConnectionCount + " 个连接";
+            OptionsSummaryText.Text = (ChildrenCheck.IsChecked == true ? "派生工具已计入" : "仅核心进程") + (_startupEnabled ? " · 自动启动已开启" : "");
             SettingsHintText.Text = running ? "暂停监控后可修改采集范围，已保存的记录不受影响。" : "选择会保存，并用于下次自动启动。";
 
             DateTime chartLast = summary.ToUtc == default ? DateTime.Today : summary.ToUtc.ToLocalTime().Date;
@@ -162,7 +171,7 @@ public partial class MainWindow : Window
                 if (earliest > chartFirst) chartFirst = earliest < chartLast.AddDays(-6) ? earliest : chartLast.AddDays(-6);
             }
             int chartDays = (int)(chartLast - chartFirst).TotalDays + 1;
-            DailyRangeText.Text = TrafficScopeLabel(_trafficScope) + " · " + (_range == DashboardRange.Today ? "今日" : "最近 " + chartDays + " 天") + (_range == DashboardRange.All ? "趋势 · 累计包含全部日期" : " · 空白日期表示当天无记录");
+            DailyRangeText.Text = ApplicationScopeLabel(_applicationScope) + " · " + TrafficScopeLabel(_trafficScope) + " · " + (_range == DashboardRange.Today ? "今日" : "最近 " + chartDays + " 天") + (_range == DashboardRange.All ? "趋势 · 累计包含全部日期" : " · 空白日期表示当天无记录");
             DailyRangeText.ToolTip = "每日上下行按本地日期汇总，只包含实际监控时段。" + (_range == DashboardRange.All ? "图表显示最近日期，顶部累计用量包含全部历史记录。" : "");
             DailyChart.SetUsage(summary.DailyUsage, chartFirst, chartLast, waiting);
 
@@ -181,7 +190,7 @@ public partial class MainWindow : Window
             UpdateTargetDetails();
             SetGridItems(ProcessesGrid, current.Processes.Select(row => new ProcessDisplayRow
             {
-                Name = row.Name, Pid = row.Pid, Kind = row.Kind == "tool" ? "派生工具" : "Codex 核心进程",
+                Name = row.Name, Pid = row.Pid, Kind = row.Application + (row.Kind == "tool" ? " 派生工具" : " 核心进程"),
                 UploadBytes = row.UploadBytes, DownloadBytes = row.DownloadBytes,
                 UploadDisplay = current.HasCapturedData ? Bytes(row.UploadBytes) : "—", DownloadDisplay = current.HasCapturedData ? Bytes(row.DownloadBytes) : "—"
             }).ToList());
@@ -210,7 +219,7 @@ public partial class MainWindow : Window
             AdminButton.Visibility = _engine.IsAdmin || _demo ? Visibility.Collapsed : Visibility.Visible;
             ChildrenCheck.IsEnabled = !running && !_demo;
             LoopbackCheck.IsEnabled = !running && !_demo;
-            SessionTimeText.Text = current.StartedAt.HasValue ? "本次全部 " + Bytes(current.UploadBytes + current.DownloadBytes) : "本次尚未开始";
+            SessionTimeText.Text = current.StartedAt.HasValue ? "本次 " + ApplicationScopeLabel(_applicationScope) + " " + Bytes(current.UploadBytes + current.DownloadBytes) : "本次尚未开始";
             SessionTimeText.ToolTip = current.StartedAt.HasValue ? "本次监控自 " + current.StartedAt.Value.ToString("HH:mm:ss") + " 开始，顶部统计包含所选范围的历史记录。" : "点击开始监控，记录将自动保存在本机。";
             WarningText.Text = "未知未取得足够代理报告，不等于直连；仅含已监控时段与 socket 流量。";
             WarningText.ToolTip = string.Join("\n", new[] { WarningText.Text, summary.Warning, current.Warning }.Where(value => !string.IsNullOrWhiteSpace(value)).Distinct());
@@ -235,9 +244,9 @@ public partial class MainWindow : Window
         _compactLayout = compact;
         var content = (Grid)Content;
         content.Margin = compact ? new Thickness(28, 16, 28, 10) : new Thickness(28, 20, 28, 14);
-        content.RowDefinitions[0].Height = new GridLength(compact ? 54 : 58);
+        content.RowDefinitions[0].Height = new GridLength(compact ? 60 : 64);
         content.RowDefinitions[1].Height = new GridLength(compact ? 38 : 42);
-        content.RowDefinitions[3].Height = new GridLength(compact ? 176 : 212);
+        content.RowDefinitions[3].Height = new GridLength(compact ? 170 : 212);
         content.RowDefinitions[4].Height = new GridLength(compact ? 28 : 32);
         DailyChart.MinHeight = compact ? 90 : 110;
         Resources["RankingRowMargin"] = new Thickness(0, compact ? 0 : 3, 0, compact ? 0 : 3);
@@ -245,10 +254,11 @@ public partial class MainWindow : Window
 
     private static string RangeLabel(DashboardRange range) => range switch { DashboardRange.Today => "今日", DashboardRange.Last7Days => "近 7 天", DashboardRange.Last30Days => "近 30 天", _ => "全部记录" };
     private static string TrafficScopeLabel(DashboardTrafficScope scope) => scope == DashboardTrafficScope.Proxy ? "已确认代理" : "全部流量";
+    private static string ApplicationScopeLabel(DashboardApplicationScope scope) => scope switch { DashboardApplicationScope.Codex => "Codex", DashboardApplicationScope.Claude => "Claude", _ => "合计" };
     private static string TrafficKindLabel(TrafficKind kind) => kind switch { TrafficKind.Proxy => "已确认代理", TrafficKind.Direct => "已确认直连", _ => "未知，未取得足够代理报告，不等于直连" };
     private static string ShortTrafficKindLabel(TrafficKind kind) => kind switch { TrafficKind.Proxy => "代理", TrafficKind.Direct => "直连", _ => "未知" };
     private static string TargetName(TargetRow row) => !string.IsNullOrWhiteSpace(row.Hostname) ? row.Hostname : !string.IsNullOrWhiteSpace(row.Target) ? row.Target : row.Address;
-    private static string TargetIdentity(TargetRow row) => string.Join("\u001f", row.Process.ToLowerInvariant(), row.Protocol.ToUpperInvariant(), row.Address.ToLowerInvariant(), row.Port, row.Hostname.ToLowerInvariant(), row.ProxyDestination.ToLowerInvariant(), row.ProxyNode, row.ProxyType.ToLowerInvariant(), row.TrafficKind);
+    private static string TargetIdentity(TargetRow row) => string.Join("\u001f", row.Application, row.Process.ToLowerInvariant(), row.Protocol.ToUpperInvariant(), row.Address.ToLowerInvariant(), row.Port, row.Hostname.ToLowerInvariant(), row.ProxyDestination.ToLowerInvariant(), row.ProxyNode, row.ProxyType.ToLowerInvariant(), row.TrafficKind);
     private static string DisplayRoute(TargetRow row)
     {
         string route = row.Route;
@@ -259,7 +269,7 @@ public partial class MainWindow : Window
         if (route.Contains("保留", StringComparison.Ordinal)) return "保留地址";
         return route;
     }
-    private static bool TargetMatches(TargetRow row, string search) => new[] { row.Hostname, row.Address, row.Target, row.ProxyDestination, row.Process, row.Region, row.ProxyNode, row.ProxyChain, row.ProxyType, TrafficKindLabel(row.TrafficKind), ConnectionPresentation.RegionLabel(row), ConnectionPresentation.NodeLabel(row), ConnectionPresentation.NodeContext(row) }.Any(value => value?.Contains(search, StringComparison.OrdinalIgnoreCase) == true);
+    private static bool TargetMatches(TargetRow row, string search) => new[] { row.Application.ToString(), row.Hostname, row.Address, row.Target, row.ProxyDestination, row.Process, row.Region, row.ProxyNode, row.ProxyChain, row.ProxyType, TrafficKindLabel(row.TrafficKind), ConnectionPresentation.RegionLabel(row), ConnectionPresentation.NodeLabel(row), ConnectionPresentation.NodeContext(row) }.Any(value => value?.Contains(search, StringComparison.OrdinalIgnoreCase) == true);
     private static bool SessionInRange(SessionRow row, DashboardSnapshot summary) => !summary.FromUtc.HasValue || (DateTime.TryParse(row.StartedAt, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out var started) && started.ToUniversalTime() >= summary.FromUtc.Value && started.ToUniversalTime() <= summary.ToUtc);
 
     private void SetGridItems(DataGrid grid, System.Collections.IEnumerable rows)
@@ -318,6 +328,26 @@ public partial class MainWindow : Window
         RefreshSnapshot(false);
     }
 
+    private void ApplicationScopeButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_loading || sender is not Button button || !Enum.TryParse<DashboardApplicationScope>(button.Tag?.ToString(), out var next) || next == _applicationScope) return;
+        _applicationScope = next;
+        _selectedTargetKey = null;
+        RefreshSnapshot(false);
+    }
+
+    private void UpdateApplicationScopeButtons()
+    {
+        foreach (var button in new[] { ApplicationTotalButton, ApplicationCodexButton, ApplicationClaudeButton })
+        {
+            bool selected = button.Tag?.ToString() == _applicationScope.ToString();
+            button.Background = selected ? Brushes.White : Brushes.Transparent;
+            button.Foreground = new SolidColorBrush(selected ? Color.FromRgb(27, 48, 64) : Color.FromRgb(102, 120, 136));
+            button.FontWeight = selected ? FontWeights.SemiBold : FontWeights.Normal;
+            System.Windows.Automation.AutomationProperties.SetHelpText(button, selected ? "当前应用范围" : "切换应用范围；时间与代理筛选保持不变");
+        }
+    }
+
     private void UpdateTrafficScopeButtons()
     {
         foreach (var button in new[] { TrafficAllButton, TrafficProxyButton })
@@ -343,6 +373,58 @@ public partial class MainWindow : Window
     }
 
     private void SettingsButton_Click(object sender, RoutedEventArgs e) => SettingsPopup.IsOpen = !SettingsPopup.IsOpen;
+    private async void CheckUpdateButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_checkingUpdate || _disposed) return;
+        if (_demo) { UpdateStatusText.Text = "演示预览 · 实际检测会读取 GitHub Releases 的正式版本"; return; }
+        SetUpdateCheckState(true);
+        try
+        {
+            var result = await UpdateChecker.CheckAsync(_updateCancellation.Token);
+            if (_disposed) return;
+            SetUpdateCheckState(false, result);
+        }
+        catch (OperationCanceledException) { if (!_disposed) SetUpdateCheckState(false, new() { Status = UpdateCheckStatus.Error, Message = "检测已取消，可重新检测" }); }
+        catch (Exception) { if (!_disposed) SetUpdateCheckState(false, new() { Status = UpdateCheckStatus.Error, Message = "暂时无法检测更新，请检查网络后重试" }); }
+        finally
+        {
+            _checkingUpdate = false;
+            if (!_disposed)
+            {
+                CheckUpdateButton.IsEnabled = true;
+                CheckUpdateButton.Content = "重新检测";
+            }
+        }
+    }
+
+    private void SetUpdateCheckState(bool checking, UpdateCheckResult? result = null)
+    {
+        _checkingUpdate = checking;
+        _availableUpdate = !checking && result?.Status == UpdateCheckStatus.Available ? result : null;
+        CheckUpdateButton.IsEnabled = !checking;
+        CheckUpdateButton.Content = checking ? "检测中…" : "重新检测";
+        DownloadUpdateButton.Visibility = _availableUpdate == null ? Visibility.Collapsed : Visibility.Visible;
+        if (checking)
+        {
+            UpdateStatusText.Text = "正在连接 GitHub，检测正式版本…";
+            UpdateStatusText.Foreground = new SolidColorBrush(Color.FromRgb(80, 112, 129));
+        }
+        else if (result != null)
+        {
+            UpdateStatusText.Text = result.Message;
+            UpdateStatusText.Foreground = new SolidColorBrush(result.Status == UpdateCheckStatus.Error ? Color.FromRgb(160, 104, 55) : Color.FromRgb(80, 112, 129));
+            DownloadUpdateButton.Content = "下载新版";
+            DownloadUpdateButton.ToolTip = "v" + result.LatestVersion + " · 在浏览器打开 GitHub 正式安装包，由你选择下载和安装";
+        }
+    }
+
+    private void DownloadUpdateButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_availableUpdate == null || _demo) return;
+        try { UpdateChecker.OpenDownload(_availableUpdate); }
+        catch (Exception) { UpdateStatusText.Text = "无法打开浏览器，请重新检测后重试"; }
+    }
+
     private void ExitButton_Click(object sender, RoutedEventArgs e) { SettingsPopup.IsOpen = false; RequestExit(); }
     private void CaptionMinimize_Click(object sender, RoutedEventArgs e) => SystemCommands.MinimizeWindow(this);
     private void CaptionMaximize_Click(object sender, RoutedEventArgs e)
@@ -511,7 +593,7 @@ public partial class MainWindow : Window
             + (status.Enabled ? "\n已启用，关闭窗口后仍会在系统托盘运行。" : "\n当前未启用。")
             + (!string.IsNullOrWhiteSpace(status.ExecutablePath) ? "\n启动程序：" + status.ExecutablePath : "")
             + (!string.IsNullOrWhiteSpace(status.Error) ? "\n" + status.Error : "");
-        OptionsSummaryText.Text = (ChildrenCheck.IsChecked == true ? "派生工具已计入" : "仅 Codex 核心进程") + (status.Enabled ? " · 自动启动已开启" : "");
+        OptionsSummaryText.Text = (ChildrenCheck.IsChecked == true ? "派生工具已计入" : "仅核心进程") + (status.Enabled ? " · 自动启动已开启" : "");
     }
 
     private void HideToTray(bool notify = true)
@@ -558,6 +640,8 @@ public partial class MainWindow : Window
     {
         if (_disposed) return;
         _disposed = true;
+        _updateCancellation.Cancel();
+        _updateCancellation.Dispose();
         Application.Current.SessionEnding -= Application_SessionEnding;
         _timer.Stop();
         _tray?.Dispose();
@@ -591,18 +675,18 @@ public partial class MainWindow : Window
         int count = _selectedTab == "targets" ? TargetsGrid.Items.Count : _selectedTab == "processes" ? ProcessesGrid.Items.Count : SessionsGrid.Items.Count;
         EmptyState.Visibility = count == 0 ? Visibility.Visible : Visibility.Collapsed;
         bool searching = !string.IsNullOrWhiteSpace(TargetSearchBox.Text);
-        EmptyTitle.Text = _selectedTab == "sessions" ? "当前范围没有历史会话" : _selectedTab == "processes" ? "暂未发现 Codex 进程" : _dashboard?.IsLoading == true ? "正在汇总历史记录…" : searching ? "没有匹配的流量去向" : _trafficScope == DashboardTrafficScope.Proxy ? "当前范围暂无已确认代理流量" : "当前范围还没有流量记录";
-        EmptyHint.Text = _selectedTab == "sessions" ? "会话字节为全部流量；每次停止监控后保存在本机" : _selectedTab == "processes" ? "当前进程显示全部流量的本次采集值，与顶部历史累计分开统计" : searching ? "可搜索域名、IP、地区、代理节点或路径类型" : _trafficScope == DashboardTrafficScope.Proxy ? "只包含记录时有代理证据的流量；未知未取得足够报告，不等于直连" : "开始监控后，用量会保存在本机，重启后继续累计";
-        TableHintText.Text = _selectedTab == "targets" ? RangeLabel(_range) + " · " + TrafficScopeLabel(_trafficScope) + " · 点击目标查看详情" : _selectedTab == "processes" ? "当前存活进程 · 全部流量 · 字节为本次监控值" : "全部流量 · 开始于所选时间范围的历史会话";
+        EmptyTitle.Text = _selectedTab == "sessions" ? "当前范围没有历史会话" : _selectedTab == "processes" ? "暂未发现" + (_applicationScope == DashboardApplicationScope.Total ? "监控" : ApplicationScopeLabel(_applicationScope)) + "进程" : _dashboard?.IsLoading == true ? "正在汇总历史记录…" : searching ? "没有匹配的流量去向" : _trafficScope == DashboardTrafficScope.Proxy ? "当前范围暂无已确认代理流量" : "当前范围还没有流量记录";
+        EmptyHint.Text = _selectedTab == "sessions" ? "会话字节为所选应用的全部流量；每次停止监控后保存在本机" : _selectedTab == "processes" ? "当前进程显示所选应用的全部流量，与顶部历史累计分开统计" : searching ? "可搜索应用、域名、IP、地区、代理节点或路径类型" : _trafficScope == DashboardTrafficScope.Proxy ? "只包含记录时有代理证据的流量；未知未取得足够报告，不等于直连" : "开始监控后，用量会保存在本机，重启后继续累计";
+        TableHintText.Text = ApplicationScopeLabel(_applicationScope) + " · " + (_selectedTab == "targets" ? RangeLabel(_range) + " · " + TrafficScopeLabel(_trafficScope) + " · 点击目标查看详情" : _selectedTab == "processes" ? "当前存活进程 · 全部流量 · 字节为本次监控值" : "全部流量 · 开始于所选时间范围的历史会话");
         TargetCountText.Text = (_selectedTab == "targets" && searching ? count + " / " + _targetTotalCount : count.ToString()) + (_selectedTab == "targets" ? " 个目标" : _selectedTab == "processes" ? " 个进程" : " 个会话");
     }
 
     private void ExportButton_Click(object sender, RoutedEventArgs e)
     {
         if (_demo) return;
-        var dialog = new SaveFileDialog { Title = "导出" + RangeLabel(_range) + TrafficScopeLabel(_trafficScope) + "去向", Filter = "CSV 文件 (*.csv)|*.csv", FileName = "Codex_" + TrafficScopeLabel(_trafficScope) + "_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".csv", AddExtension = true };
+        var dialog = new SaveFileDialog { Title = "导出" + ApplicationScopeLabel(_applicationScope) + RangeLabel(_range) + TrafficScopeLabel(_trafficScope) + "去向", Filter = "CSV 文件 (*.csv)|*.csv", FileName = ApplicationScopeLabel(_applicationScope) + "_" + TrafficScopeLabel(_trafficScope) + "_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".csv", AddExtension = true };
         if (dialog.ShowDialog(this) != true) return;
-        try { _engine.ExportDashboardCsv(dialog.FileName, _range, _trafficScope); CaptureHintText.Text = "已导出：" + dialog.FileName; }
+        try { _engine.ExportDashboardCsv(dialog.FileName, _range, _trafficScope, _applicationScope); CaptureHintText.Text = "已导出：" + dialog.FileName; }
         catch (Exception exception) { ShowError("导出失败", exception.Message); }
     }
 
@@ -636,7 +720,7 @@ public partial class MainWindow : Window
         encoder.Save(stream);
     }
 
-    private static DashboardSnapshot CreateDemoDashboard(DashboardRange range, DashboardTrafficScope scope)
+    private static DashboardSnapshot CreateDemoDashboard(DashboardRange range, DashboardTrafficScope scope, DashboardApplicationScope applicationScope)
     {
         DateTime today = DateTime.Today;
         DateTime? first = range switch { DashboardRange.Today => today, DashboardRange.Last7Days => today.AddDays(-6), DashboardRange.Last30Days => today.AddDays(-29), _ => null };
@@ -647,69 +731,76 @@ public partial class MainWindow : Window
             DownloadBytes = (long)((21 + Math.Abs(Math.Sin(day * .43)) * 55 + (day is 8 or 17 or 25 ? 71 : 0)) * 1024 * 1024)
         }).ToList();
         var rows = history.Where(row => !first.HasValue || row.Date >= first).ToList();
-        long upload = rows.Sum(row => row.UploadBytes), download = rows.Sum(row => row.DownloadBytes);
-        var destinations = new[]
+        var destinations = new (TrackedApplication Application, string Host, string Address, int Port, string Process, string Route, string Region, string Node, int Percent, TrafficKind Kind)[]
         {
-            ("chatgpt.com", "127.0.0.1", 7897, "Codex.exe", "回环代理", "美国 · US", "美国 01", 51),
-            ("api.openai.com", "198.18.1.71", 443, "codex.exe", "虚拟地址", "美国 · US", "美国 01", 23),
-            ("cdn.oaistatic.com", "198.18.1.72", 443, "Codex.exe", "虚拟地址", "美国 · US", "美国 01", 15),
-            ("api.github.com", "198.18.1.73", 443, "node.exe", "虚拟地址", "日本 · JP", "DIRECT", 8),
-            ("", "203.0.113.18", 443, "Codex.exe", "演示地址", "", "", 3)
+            (TrackedApplication.Codex, "chatgpt.com", "127.0.0.1", 7897, "Codex.exe", "回环代理", "美国 · US", "美国 01", 40, TrafficKind.Proxy),
+            (TrackedApplication.Codex, "api.openai.com", "198.18.1.71", 443, "codex.exe", "虚拟地址", "美国 · US", "美国 01", 20, TrafficKind.Proxy),
+            (TrackedApplication.Claude, "api.anthropic.com", "198.18.1.72", 443, "claude.exe", "虚拟地址", "美国 · US", "美国 01", 25, TrafficKind.Proxy),
+            (TrackedApplication.Claude, "claude.ai", "198.18.1.73", 443, "Claude.exe", "虚拟地址", "日本 · JP", "日本 02", 5, TrafficKind.Proxy),
+            (TrackedApplication.Codex, "api.github.com", "198.18.1.74", 443, "node.exe", "虚拟地址", "日本 · JP", "DIRECT", 5, TrafficKind.Direct),
+            (TrackedApplication.Claude, "registry.npmjs.org", "198.18.1.75", 443, "node.exe", "虚拟地址", "美国 · US", "DIRECT", 3, TrafficKind.Direct),
+            (TrackedApplication.Codex, "", "203.0.113.18", 443, "Codex.exe", "演示地址", "", "", 2, TrafficKind.Unknown)
         };
-        long Allocate(long value, int index) => index == destinations.Length - 1 ? value - destinations.Take(index).Sum(destination => value * destination.Item8 / 100) : value * destinations[index].Item8 / 100;
-        var targets = destinations.Select((row, index) =>
+        bool ApplicationMatches(TrackedApplication application) => applicationScope == DashboardApplicationScope.Total || applicationScope == DashboardApplicationScope.Codex && application == TrackedApplication.Codex || applicationScope == DashboardApplicationScope.Claude && application == TrackedApplication.Claude;
+        long Allocate(long value, int index) => index == destinations.Length - 1 ? value - destinations.Take(index).Sum(destination => value * destination.Percent / 100) : value * destinations[index].Percent / 100;
+        long Portion(long value, Func<int, bool> include) => Enumerable.Range(0, destinations.Length).Where(include).Sum(index => Allocate(value, index));
+        bool Selected(int index) => ApplicationMatches(destinations[index].Application) && (scope == DashboardTrafficScope.All || destinations[index].Kind == TrafficKind.Proxy);
+        var allTargets = destinations.Select((row, index) => new TargetRow
         {
-            long up = rows.Sum(day => Allocate(day.UploadBytes, index));
-            long down = rows.Sum(day => Allocate(day.DownloadBytes, index));
-            var kind = index < 3 ? TrafficKind.Proxy : index == 3 ? TrafficKind.Direct : TrafficKind.Unknown;
-            return new TargetRow { Hostname = row.Item1, Target = row.Item2, Address = row.Item2, Port = row.Item3, Process = row.Item4, Protocol = "TCP", Route = row.Item5, Region = row.Item6, RegionSource = "演示数据", ProxyNode = row.Item7, ProxyChain = index < 3 ? "自动选择 → " + row.Item7 : row.Item7, ProxyType = index < 3 ? "Shadowsocks" : index == 3 ? "Direct" : "", TrafficKind = kind, TrafficKindSource = "演示数据 · " + (index < 3 ? "代理报告节点和出口类型" : index == 3 ? "出口类型 Direct" : "未取得代理报告"), DomainSource = row.Item1.Length > 0 ? "代理报告 · 演示数据" : "", UploadBytes = up, DownloadBytes = down, LastSeen = DateTime.Now };
+            Application = row.Application, Hostname = row.Host, Target = row.Address, Address = row.Address, Port = row.Port, Process = row.Process, Protocol = "TCP", Route = row.Route, Region = row.Region,
+            RegionSource = "演示数据", ProxyNode = row.Node, ProxyChain = row.Kind == TrafficKind.Proxy ? "自动选择 → " + row.Node : row.Node,
+            ProxyType = row.Kind == TrafficKind.Proxy ? "Shadowsocks" : row.Kind == TrafficKind.Direct ? "Direct" : "", TrafficKind = row.Kind,
+            TrafficKindSource = "演示数据 · " + (row.Kind == TrafficKind.Proxy ? "代理报告节点和出口类型" : row.Kind == TrafficKind.Direct ? "出口类型 Direct" : "未取得代理报告"),
+            DomainSource = row.Host.Length > 0 ? "代理报告 · 演示数据" : "", UploadBytes = rows.Sum(day => Allocate(day.UploadBytes, index)), DownloadBytes = rows.Sum(day => Allocate(day.DownloadBytes, index)), LastSeen = DateTime.Now
         }).ToList();
-        long proxyUp = targets.Where(row => row.TrafficKind == TrafficKind.Proxy).Sum(row => row.UploadBytes);
-        long proxyDown = targets.Where(row => row.TrafficKind == TrafficKind.Proxy).Sum(row => row.DownloadBytes);
-        long directUp = targets.Where(row => row.TrafficKind == TrafficKind.Direct).Sum(row => row.UploadBytes);
-        long directDown = targets.Where(row => row.TrafficKind == TrafficKind.Direct).Sum(row => row.DownloadBytes);
-        long ProxyPortion(long value) => Enumerable.Range(0, 3).Sum(index => Allocate(value, index));
-        var selectedRows = scope == DashboardTrafficScope.All ? rows : rows.Select(day => new DailyUsageRow { Date = day.Date, UploadBytes = ProxyPortion(day.UploadBytes), DownloadBytes = ProxyPortion(day.DownloadBytes) }).ToList();
+        var applicationTargets = allTargets.Where(row => ApplicationMatches(row.Application)).ToList();
+        var targets = applicationTargets.Where(row => scope == DashboardTrafficScope.All || row.TrafficKind == TrafficKind.Proxy).ToList();
+        long upload = applicationTargets.Sum(row => row.UploadBytes), download = applicationTargets.Sum(row => row.DownloadBytes);
+        long proxyUp = applicationTargets.Where(row => row.TrafficKind == TrafficKind.Proxy).Sum(row => row.UploadBytes), proxyDown = applicationTargets.Where(row => row.TrafficKind == TrafficKind.Proxy).Sum(row => row.DownloadBytes);
+        long directUp = applicationTargets.Where(row => row.TrafficKind == TrafficKind.Direct).Sum(row => row.UploadBytes), directDown = applicationTargets.Where(row => row.TrafficKind == TrafficKind.Direct).Sum(row => row.DownloadBytes);
+        long ApplicationTotal(TrackedApplication application, bool up) => allTargets.Where(row => row.Application == application && (scope == DashboardTrafficScope.All || row.TrafficKind == TrafficKind.Proxy)).Sum(row => up ? row.UploadBytes : row.DownloadBytes);
+        var selectedRows = rows.Select(day => new DailyUsageRow { Date = day.Date, UploadBytes = Portion(day.UploadBytes, Selected), DownloadBytes = Portion(day.DownloadBytes, Selected) }).ToList();
         var currentDay = history.Last();
         return new DashboardSnapshot
         {
-            Range = range, TrafficScope = scope, FromUtc = first?.ToUniversalTime(), ToUtc = DateTime.UtcNow, FirstRecordedUtc = today.AddDays(-29).ToUniversalTime(),
-            UploadBytes = scope == DashboardTrafficScope.All ? upload : proxyUp, DownloadBytes = scope == DashboardTrafficScope.All ? download : proxyDown,
+            Range = range, TrafficScope = scope, ApplicationScope = applicationScope, FromUtc = first?.ToUniversalTime(), ToUtc = DateTime.UtcNow, FirstRecordedUtc = today.AddDays(-29).ToUniversalTime(),
+            UploadBytes = targets.Sum(row => row.UploadBytes), DownloadBytes = targets.Sum(row => row.DownloadBytes),
             AllUploadBytes = upload, AllDownloadBytes = download, ProxyUploadBytes = proxyUp, ProxyDownloadBytes = proxyDown,
             DirectUploadBytes = directUp, DirectDownloadBytes = directDown, UnknownUploadBytes = upload - proxyUp - directUp, UnknownDownloadBytes = download - proxyDown - directDown,
-            TodayUploadBytes = scope == DashboardTrafficScope.All ? currentDay.UploadBytes : ProxyPortion(currentDay.UploadBytes), TodayDownloadBytes = scope == DashboardTrafficScope.All ? currentDay.DownloadBytes : ProxyPortion(currentDay.DownloadBytes),
-            RecordedDays = rows.Count, SessionCount = rows.Count * 3 + 1, HasRecords = true, DailyUsage = selectedRows, Targets = scope == DashboardTrafficScope.All ? targets : targets.Where(row => row.TrafficKind == TrafficKind.Proxy).ToList()
+            CodexUploadBytes = ApplicationTotal(TrackedApplication.Codex, true), CodexDownloadBytes = ApplicationTotal(TrackedApplication.Codex, false), ClaudeUploadBytes = ApplicationTotal(TrackedApplication.Claude, true), ClaudeDownloadBytes = ApplicationTotal(TrackedApplication.Claude, false),
+            TodayUploadBytes = Portion(currentDay.UploadBytes, Selected), TodayDownloadBytes = Portion(currentDay.DownloadBytes, Selected),
+            RecordedDays = rows.Count, SessionCount = rows.Count * 3 + 1, HasRecords = true, DailyUsage = selectedRows, Targets = targets
         };
     }
 
-    private static MonitorSnapshot CreateDemoSnapshot()
+    private static MonitorSnapshot CreateDemoSnapshot(DashboardApplicationScope applicationScope)
     {
         var now = DateTime.Now;
+        var allProcesses = new List<ProcessRow>
+        {
+            new() { Application = TrackedApplication.Codex, Name = "Codex.exe", Pid = 17420, Kind = "core", UploadBytes = 2_506_752, DownloadBytes = 17_612_800 },
+            new() { Application = TrackedApplication.Codex, Name = "codex.exe", Pid = 18304, Kind = "core", UploadBytes = 163_840, DownloadBytes = 747_520 },
+            new() { Application = TrackedApplication.Claude, Name = "Claude.exe", Pid = 18116, Kind = "core", UploadBytes = 1_112_064, DownloadBytes = 6_913_024 },
+            new() { Application = TrackedApplication.Claude, Name = "node.exe", Pid = 18508, Kind = "tool", UploadBytes = 65_536, DownloadBytes = 327_680 }
+        };
+        var processes = allProcesses.Where(row => applicationScope == DashboardApplicationScope.Total || applicationScope == DashboardApplicationScope.Codex && row.Application == TrackedApplication.Codex || applicationScope == DashboardApplicationScope.Claude && row.Application == TrackedApplication.Claude).ToList();
+        long codexUp = allProcesses.Where(row => row.Application == TrackedApplication.Codex).Sum(row => row.UploadBytes), codexDown = allProcesses.Where(row => row.Application == TrackedApplication.Codex).Sum(row => row.DownloadBytes);
+        long claudeUp = allProcesses.Where(row => row.Application == TrackedApplication.Claude).Sum(row => row.UploadBytes), claudeDown = allProcesses.Where(row => row.Application == TrackedApplication.Claude).Sum(row => row.DownloadBytes);
+        bool codex = applicationScope != DashboardApplicationScope.Claude, claude = applicationScope != DashboardApplicationScope.Codex;
         return new MonitorSnapshot
         {
-            CapturedAt = now, StartedAt = now.AddMinutes(-18).AddSeconds(-42), HasCapturedData = true,
-            UploadBytes = 2_670_592, DownloadBytes = 18_360_320, UploadBytesPerSecond = 6_820, DownloadBytesPerSecond = 42_800,
-            ProcessCount = 4, ConnectionCount = 8, CaptureStatus = "正在记录",
-            Targets = new List<TargetRow>
-            {
-                new() { Target = "127.0.0.1", Address = "127.0.0.1", Port = 7897, Process = "Codex.exe", Protocol = "TCP", Route = "本机回环（可能代理）", UploadBytes = 2_437_120, DownloadBytes = 17_405_952, LastSeen = now },
-                new() { Target = "198.18.1.71", Address = "198.18.1.71", Port = 443, Process = "codex.exe", Protocol = "TCP", Route = "虚拟地址（可能 TUN）", UploadBytes = 163_840, DownloadBytes = 747_520, LastSeen = now.AddSeconds(-2) },
-                new() { Target = "203.0.113.18", Address = "203.0.113.18", Port = 443, Process = "Codex.exe", Protocol = "TCP", Route = "保留地址（演示示例）", UploadBytes = 69_632, DownloadBytes = 206_848, LastSeen = now.AddSeconds(-17) }
-            },
-            Processes = new List<ProcessRow>
-            {
-                new() { Name = "Codex.exe", Pid = 17420, Kind = "core", UploadBytes = 2_506_752, DownloadBytes = 17_612_800 },
-                new() { Name = "codex.exe", Pid = 18304, Kind = "core", UploadBytes = 163_840, DownloadBytes = 747_520 },
-                new() { Name = "Codex.exe", Pid = 18116, Kind = "core" }, new() { Name = "Codex.exe", Pid = 18508, Kind = "core" }
-            },
+            ApplicationScope = applicationScope, CapturedAt = now, StartedAt = now.AddMinutes(-18).AddSeconds(-42), HasCapturedData = true,
+            UploadBytes = processes.Sum(row => row.UploadBytes), DownloadBytes = processes.Sum(row => row.DownloadBytes),
+            CodexUploadBytes = codexUp, CodexDownloadBytes = codexDown, ClaudeUploadBytes = claudeUp, ClaudeDownloadBytes = claudeDown,
+            UploadBytesPerSecond = (codex ? 6_820 : 0) + (claude ? 3_210 : 0), DownloadBytesPerSecond = (codex ? 42_800 : 0) + (claude ? 18_400 : 0),
+            ProcessCount = processes.Count, ConnectionCount = processes.Count * 2, CaptureStatus = "正在记录", Processes = processes,
             Sessions = new List<SessionRow>
             {
-                new() { StartedAt = now.AddDays(-1).ToString("yyyy-MM-dd HH:mm:ss"), Duration = "00:35:12", UploadBytes = 5_312_512, DownloadBytes = 33_554_432 },
-                new() { StartedAt = now.AddDays(-2).ToString("yyyy-MM-dd HH:mm:ss"), Duration = "01:02:47", UploadBytes = 12_521_472, DownloadBytes = 85_458_944 }
+                new() { StartedAt = now.AddDays(-1).ToString("yyyy-MM-dd HH:mm:ss"), Duration = "00:35:12", UploadBytes = (codex ? 5_312_512 : 0) + (claude ? 2_621_440 : 0), DownloadBytes = (codex ? 33_554_432 : 0) + (claude ? 15_728_640 : 0) },
+                new() { StartedAt = now.AddDays(-2).ToString("yyyy-MM-dd HH:mm:ss"), Duration = "01:02:47", UploadBytes = (codex ? 12_521_472 : 0) + (claude ? 4_194_304 : 0), DownloadBytes = (codex ? 85_458_944 : 0) + (claude ? 20_971_520 : 0) }
             }
         };
     }
-
     private sealed class TargetDisplayRow
     {
         public required TargetRow Source { get; init; }
@@ -718,9 +809,9 @@ public partial class MainWindow : Window
         public string Target => TargetName(Source);
         // DataGrid virtualizes rows. Format only realized cells and requested
         // details instead of eagerly building strings for the entire history.
-        public string Details => _details ??= "直接连接：" + Address + "  ·  " + Source.Process + " / " + Protocol + "\n流量路径：" + TrafficKindLabel(Source.TrafficKind) + " · " + Source.TrafficKindSource + (!string.IsNullOrWhiteSpace(Source.DomainSource) ? "\n域名来源：" + Source.DomainSource : "") + (!string.IsNullOrEmpty(Source.ProxyDestination) ? "\n代理报告目标：" + Source.ProxyDestination : "") + "\n地区 / 网络：" + Region + "  ·  连接：" + DisplayRoute(Source) + "\n地区依据：" + ConnectionPresentation.RegionDetails(Source) + "\n代理节点：" + ProxyNode + "\n节点依据：" + ConnectionPresentation.NodeDetails(Source) + (!string.IsNullOrEmpty(Source.ProxyChain) ? "\n完整代理链：" + Source.ProxyChain : "");
+        public string Details => _details ??= "所属应用：" + Source.Application + "\n直接连接：" + Address + "  ·  " + Source.Process + " / " + Protocol + "\n流量路径：" + TrafficKindLabel(Source.TrafficKind) + " · " + Source.TrafficKindSource + (!string.IsNullOrWhiteSpace(Source.DomainSource) ? "\n域名来源：" + Source.DomainSource : "") + (!string.IsNullOrEmpty(Source.ProxyDestination) ? "\n代理报告目标：" + Source.ProxyDestination : "") + "\n地区 / 网络：" + Region + "  ·  连接：" + DisplayRoute(Source) + "\n地区依据：" + ConnectionPresentation.RegionDetails(Source) + "\n代理节点：" + ProxyNode + "\n节点依据：" + ConnectionPresentation.NodeDetails(Source) + (!string.IsNullOrEmpty(Source.ProxyChain) ? "\n完整代理链：" + Source.ProxyChain : "");
         public string Address => FormatAddress(Source.Address, Source.Port);
-        public string Process => (string.IsNullOrWhiteSpace(Source.Process) ? "—" : Source.Process) + " · " + Protocol;
+        public string Process => Source.Application + " · " + (string.IsNullOrWhiteSpace(Source.Process) ? "—" : Source.Process) + " · " + Protocol;
         public string Protocol => Source.Protocol;
         public string Route => ShortTrafficKindLabel(Source.TrafficKind) + " · " + DisplayRoute(Source);
         public string Region => ConnectionPresentation.RegionLabel(Source);

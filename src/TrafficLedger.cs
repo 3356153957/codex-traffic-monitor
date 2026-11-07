@@ -12,31 +12,39 @@ public sealed class TrafficLedger
     private readonly Dictionary<string, ProcessRow> _processes = new();
     public long UploadBytes { get; private set; }
     public long DownloadBytes { get; private set; }
+    public long CodexUploadBytes { get; private set; }
+    public long CodexDownloadBytes { get; private set; }
+    public long ClaudeUploadBytes { get; private set; }
+    public long ClaudeDownloadBytes { get; private set; }
 
     public void Add(DateTime at, int pid, string name, string path, string kind, string protocol,
-        string localAddress, int localPort, string remoteAddress, int remotePort, long bytes, bool upload)
+        string localAddress, int localPort, string remoteAddress, int remotePort, long bytes, bool upload, TrackedApplication application = TrackedApplication.Codex)
     {
         if (bytes <= 0) return;
         string route = IPAddress.TryParse(remoteAddress, out var ip) ? AddressClassifier.Classify(ip) : "未知地址";
-        string targetKey = TargetKey(pid, name, protocol, localAddress, localPort, remoteAddress, remotePort);
+        string targetKey = TargetKey(pid, name, protocol, localAddress, localPort, remoteAddress, remotePort, application);
         if (!_targets.TryGetValue(targetKey, out var target))
         {
-            target = new TargetRow { Pid = pid, Process = name, Protocol = protocol, LocalAddress = localAddress, LocalPort = localPort, Address = remoteAddress, Port = remotePort, Target = AddressClassifier.Endpoint(remoteAddress, remotePort), Route = route };
+            target = new TargetRow { Application = application, Pid = pid, Process = name, Protocol = protocol, LocalAddress = localAddress, LocalPort = localPort, Address = remoteAddress, Port = remotePort, Target = AddressClassifier.Endpoint(remoteAddress, remotePort), Route = route };
             _targets.Add(targetKey, target);
         }
         target.LastSeen = at.ToLocalTime();
         if (upload) { target.UploadBytes += bytes; UploadBytes += bytes; }
         else { target.DownloadBytes += bytes; DownloadBytes += bytes; }
+        if (application == TrackedApplication.Claude)
+        { if (upload) ClaudeUploadBytes += bytes; else ClaudeDownloadBytes += bytes; }
+        else
+        { if (upload) CodexUploadBytes += bytes; else CodexDownloadBytes += bytes; }
 
-        string processKey = $"{pid}|{name}|{path}|{kind}";
+        string processKey = $"{application}|{pid}|{name}|{path}|{kind}";
         if (!_processes.TryGetValue(processKey, out var process))
-            _processes[processKey] = process = new ProcessRow { Pid = pid, Name = name, Kind = kind };
+            _processes[processKey] = process = new ProcessRow { Application = application, Pid = pid, Name = name, Kind = kind };
         if (upload) process.UploadBytes += bytes; else process.DownloadBytes += bytes;
 
         string flowKey = $"{targetKey}|{localAddress}|{localPort}|{path}|{at.ToLocalTime():yyyy-MM-dd}";
         if (!_pending.TryGetValue(flowKey, out var flow))
         {
-            flow = new FlowRecord { TimestampUtc = at.ToUniversalTime(), Pid = pid, Process = name, ProcessPath = path, Protocol = protocol, LocalAddress = localAddress, LocalPort = localPort, RemoteAddress = remoteAddress, RemotePort = remotePort, Route = route, ProxyType = "Unknown" };
+            flow = new FlowRecord { Application = application, TimestampUtc = at.ToUniversalTime(), Pid = pid, Process = name, ProcessPath = path, Protocol = protocol, LocalAddress = localAddress, LocalPort = localPort, RemoteAddress = remoteAddress, RemotePort = remotePort, Route = route, ProxyType = "Unknown" };
             _pending.Add(flowKey, flow);
         }
         if (upload) flow.UploadBytes += bytes; else flow.DownloadBytes += bytes;
@@ -52,8 +60,8 @@ public sealed class TrafficLedger
     public List<FlowRecord> Pending() => _pending.Values.ToList();
     public void CommitPending() => _pending.Clear();
 
-    private static string TargetKey(int pid, string name, string protocol, string localAddress, int localPort, string remoteAddress, int remotePort)
-        => $"{pid}|{name}|{protocol}|{remoteAddress}|{remotePort}|{localAddress}|{localPort}";
+    private static string TargetKey(int pid, string name, string protocol, string localAddress, int localPort, string remoteAddress, int remotePort, TrackedApplication application)
+        => $"{application}|{pid}|{name}|{protocol}|{remoteAddress}|{remotePort}|{localAddress}|{localPort}";
 
     public void Annotate(FlowRecord flow, ProxyHint hint)
     {
@@ -65,7 +73,7 @@ public sealed class TrafficLedger
         flow.ProxyType = hint.OutboundType;
         flow.Region = hint.Region;
         flow.RegionSource = hint.Region.Length > 0 ? "代理报告的目标 GeoIP" : "";
-        string key = TargetKey(flow.Pid, flow.Process, flow.Protocol, flow.LocalAddress, flow.LocalPort, flow.RemoteAddress, flow.RemotePort);
+        string key = TargetKey(flow.Pid, flow.Process, flow.Protocol, flow.LocalAddress, flow.LocalPort, flow.RemoteAddress, flow.RemotePort, flow.Application);
         if (!_targets.TryGetValue(key, out var target)) return;
         if (!_reportedHosts.TryGetValue(key, out var hosts)) _reportedHosts[key] = hosts = new();
         if (!string.IsNullOrEmpty(hint.Host)) hosts.Add(hint.Host);
@@ -82,7 +90,7 @@ public sealed class TrafficLedger
     public void MarkUnconfirmed(FlowRecord flow)
     {
         flow.ProxyType = "Unknown";
-        string key = TargetKey(flow.Pid, flow.Process, flow.Protocol, flow.LocalAddress, flow.LocalPort, flow.RemoteAddress, flow.RemotePort);
+        string key = TargetKey(flow.Pid, flow.Process, flow.Protocol, flow.LocalAddress, flow.LocalPort, flow.RemoteAddress, flow.RemotePort, flow.Application);
         if (_targets.TryGetValue(key, out var target)) RecordTargetType(key, target, flow.ProxyType);
     }
 
@@ -96,11 +104,18 @@ public sealed class TrafficLedger
         TrafficClassifier.Apply(target);
     }
 
-    public List<TargetRow> Targets() => _targets.Values.OrderByDescending(x => x.UploadBytes + x.DownloadBytes).Select(x => new TargetRow
+    public List<TargetRow> Targets(DashboardApplicationScope scope = DashboardApplicationScope.Total) => _targets.Values.Where(x => ApplicationFilter.Matches(x.Application, scope)).OrderByDescending(x => x.UploadBytes + x.DownloadBytes).Select(x => new TargetRow
     {
-        Target = x.Target, Address = x.Address, LocalAddress = x.LocalAddress, LocalPort = x.LocalPort, Port = x.Port, Pid = x.Pid, Process = x.Process, Protocol = x.Protocol,
+        Application = x.Application, Target = x.Target, Address = x.Address, LocalAddress = x.LocalAddress, LocalPort = x.LocalPort, Port = x.Port, Pid = x.Pid, Process = x.Process, Protocol = x.Protocol,
         Route = x.Route, Hostname = x.Hostname, DomainSource = x.DomainSource, ProxyDestination = x.ProxyDestination, ProxyChain = x.ProxyChain, ProxyNode = x.ProxyNode, ProxyType = x.ProxyType, TrafficKind = x.TrafficKind, TrafficKindSource = x.TrafficKindSource, Region = x.Region, RegionSource = x.RegionSource, UploadBytes = x.UploadBytes, DownloadBytes = x.DownloadBytes, LastSeen = x.LastSeen
     }).ToList();
 
-    public List<ProcessRow> Processes() => _processes.Values.Select(x => new ProcessRow { Name = x.Name, Pid = x.Pid, Kind = x.Kind, UploadBytes = x.UploadBytes, DownloadBytes = x.DownloadBytes }).ToList();
+    public List<ProcessRow> Processes(DashboardApplicationScope scope = DashboardApplicationScope.Total) => _processes.Values.Where(x => ApplicationFilter.Matches(x.Application, scope)).Select(x => new ProcessRow { Application = x.Application, Name = x.Name, Pid = x.Pid, Kind = x.Kind, UploadBytes = x.UploadBytes, DownloadBytes = x.DownloadBytes }).ToList();
+
+    public (long Upload, long Download) Totals(DashboardApplicationScope scope) => scope switch
+    {
+        DashboardApplicationScope.Codex => (CodexUploadBytes, CodexDownloadBytes),
+        DashboardApplicationScope.Claude => (ClaudeUploadBytes, ClaudeDownloadBytes),
+        _ => (UploadBytes, DownloadBytes)
+    };
 }

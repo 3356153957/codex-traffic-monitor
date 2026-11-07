@@ -6,6 +6,18 @@ namespace CodexTraffic;
 public enum DashboardRange { All, Today, Last7Days, Last30Days }
 public enum DashboardTrafficScope { All, Proxy }
 public enum TrafficKind { Unknown, Direct, Proxy }
+public enum TrackedApplication { Codex, Claude }
+public enum DashboardApplicationScope { Total, Codex, Claude }
+
+public static class ApplicationFilter
+{
+    public static bool Matches(TrackedApplication application, DashboardApplicationScope scope) => scope switch
+    {
+        DashboardApplicationScope.Codex => application == TrackedApplication.Codex,
+        DashboardApplicationScope.Claude => application == TrackedApplication.Claude,
+        _ => true
+    };
+}
 
 public sealed class DailyUsageRow
 {
@@ -16,6 +28,11 @@ public sealed class DailyUsageRow
 
 public sealed class DashboardSnapshot
 {
+    public DashboardApplicationScope ApplicationScope { get; set; }
+    public long CodexUploadBytes { get; set; }
+    public long CodexDownloadBytes { get; set; }
+    public long ClaudeUploadBytes { get; set; }
+    public long ClaudeDownloadBytes { get; set; }
     public DashboardRange Range { get; set; }
     public DashboardTrafficScope TrafficScope { get; set; }
     public DateTime? FromUtc { get; set; }
@@ -44,6 +61,11 @@ public sealed class DashboardSnapshot
 
 public sealed class MonitorSnapshot
 {
+    public DashboardApplicationScope ApplicationScope { get; set; }
+    public long CodexUploadBytes { get; set; }
+    public long CodexDownloadBytes { get; set; }
+    public long ClaudeUploadBytes { get; set; }
+    public long ClaudeDownloadBytes { get; set; }
     public DateTime CapturedAt { get; set; } = DateTime.Now;
     public DateTime? StartedAt { get; set; }
     public long UploadBytes { get; set; }
@@ -64,6 +86,7 @@ public sealed class MonitorSnapshot
 
 public sealed class TargetRow
 {
+    public TrackedApplication Application { get; set; }
     public string Target { get; set; } = "";
     public string Address { get; set; } = "";
     public string LocalAddress { get; set; } = "";
@@ -90,6 +113,7 @@ public sealed class TargetRow
 
 public sealed class ProcessRow
 {
+    public TrackedApplication Application { get; set; }
     public string Name { get; set; } = "";
     public int Pid { get; set; }
     public string Kind { get; set; } = "core";
@@ -99,6 +123,11 @@ public sealed class ProcessRow
 
 public sealed class SessionRow
 {
+    public int AccountingVersion { get; set; }
+    public long CodexUploadBytes { get; set; }
+    public long CodexDownloadBytes { get; set; }
+    public long ClaudeUploadBytes { get; set; }
+    public long ClaudeDownloadBytes { get; set; }
     public string StartedAt { get; set; } = "";
     public string Duration { get; set; } = "";
     public long UploadBytes { get; set; }
@@ -108,6 +137,8 @@ public sealed class SessionRow
 
 public sealed class FlowRecord
 {
+    // Missing fields in pre-Claude JSONL records deserialize to Codex (zero).
+    public TrackedApplication Application { get; set; }
     public DateTime TimestampUtc { get; set; }
     public int Pid { get; set; }
     public string Process { get; set; } = "";
@@ -132,6 +163,11 @@ public sealed class FlowRecord
 
 public sealed class SessionRecord
 {
+    public int AccountingVersion { get; set; }
+    public long CodexUploadBytes { get; set; }
+    public long CodexDownloadBytes { get; set; }
+    public long ClaudeUploadBytes { get; set; }
+    public long ClaudeDownloadBytes { get; set; }
     public string Id { get; set; } = "";
     public DateTime StartedUtc { get; set; }
     public DateTime UpdatedUtc { get; set; }

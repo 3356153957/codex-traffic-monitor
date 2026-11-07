@@ -27,6 +27,10 @@ public static class SelfTests
             checks.AddRange(LocalProxyHintCacheSelfTests.Run());
             checks.AddRange(InstallerIntegrationSelfTests.Run());
             checks.AddRange(TrafficScopeSelfTests.Run());
+            checks.AddRange(ApplicationAnalyticsSelfTests.Run());
+            checks.AddRange(ApplicationProcessSelfTests.Run());
+            checks.AddRange(ApplicationLedgerSelfTests.Run());
+            checks.AddRange(UpdateCheckerSelfTests.Run());
             var startupDocument = System.Xml.Linq.XDocument.Parse(StartupManager.BuildTaskXml(Path.Combine(directory, "含 空格", "CodexTrafficMonitor.exe"), "S-1-5-21-123-456-789-1001"));
             System.Xml.Linq.XNamespace taskNs = "http://schemas.microsoft.com/windows/2004/02/mit/task";
             Check(startupDocument.Descendants(taskNs + "LogonTrigger").Count() == 1 && !startupDocument.Descendants(taskNs + "BootTrigger").Any() && startupDocument.Descendants(taskNs + "UserId").All(x => x.Value == "S-1-5-21-123-456-789-1001"), "Startup task triggers only for the selected user's login");
