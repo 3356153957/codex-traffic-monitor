@@ -13,35 +13,50 @@ public sealed class HistoryAnalytics
     private const int MaximumLineBytes = 4 * 1024 * 1024;
     private readonly object _gate = new();
     private readonly string _directory;
+    private readonly Func<DateTime> _utcNow;
     private readonly Dictionary<string, SessionIndex> _sessions = new(StringComparer.OrdinalIgnoreCase);
     private bool _loaded;
+    private DateTime _publishedDay;
+    private bool _needsPublish = true;
     private string _directoryWarning = "";
     private IReadOnlyDictionary<(DashboardRange Range, DashboardTrafficScope Scope), DashboardSnapshot> _published = Enum.GetValues<DashboardRange>()
         .SelectMany(range => Enum.GetValues<DashboardTrafficScope>().Select(scope => (range, scope)))
         .ToDictionary(key => key, key => new DashboardSnapshot { Range = key.range, TrafficScope = key.scope, IsLoading = true });
 
-    public HistoryAnalytics(string dataDirectory) => _directory = Path.Combine(dataDirectory, "sessions");
+    public HistoryAnalytics(string dataDirectory, Func<DateTime>? utcNow = null)
+    {
+        _directory = Path.Combine(dataDirectory, "sessions");
+        _utcNow = utcNow ?? (() => DateTime.UtcNow);
+    }
 
     public void Refresh()
     {
         lock (_gate)
         {
+            DateTime now = _utcNow();
+            DateTime today = now.ToLocalTime().Date;
+            bool changed = _needsPublish || !_loaded || _publishedDay != today;
+            string previousWarning = _directoryWarning;
             try
             {
                 // Enumerate directly: Exists also returns false on permission errors,
                 // which must not masquerade as a successful empty-history refresh.
                 var paths = Directory.GetDirectories(_directory);
                 var present = new HashSet<string>(paths, StringComparer.OrdinalIgnoreCase);
-                foreach (string removed in _sessions.Keys.Where(x => !present.Contains(x)).ToList()) _sessions.Remove(removed);
+                foreach (string removed in _sessions.Keys.Where(x => !present.Contains(x)).ToList())
+                { _sessions.Remove(removed); changed = true; }
                 foreach (string path in paths)
                 {
-                    if (!_sessions.TryGetValue(path, out var index)) _sessions[path] = index = new SessionIndex(path);
+                    if (!_sessions.TryGetValue(path, out var index))
+                    { _sessions[path] = index = new SessionIndex(path); changed = true; }
+                    var before = index.Stamp;
                     ReadMetadata(index);
                     ReadFlows(index);
+                    changed |= before != index.Stamp;
                 }
                 _directoryWarning = "";
             }
-            catch (DirectoryNotFoundException) { _sessions.Clear(); _directoryWarning = ""; }
+            catch (DirectoryNotFoundException) { changed |= _sessions.Count > 0; _sessions.Clear(); _directoryWarning = ""; }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
                 _directoryWarning = "无法读取部分历史目录，保留上次成功读取的统计：" + e.Message;
@@ -49,10 +64,16 @@ public sealed class HistoryAnalytics
             finally
             {
                 _loaded = true;
-                var snapshots = Enum.GetValues<DashboardRange>()
-                    .SelectMany(range => Enum.GetValues<DashboardTrafficScope>().Select(scope => (range, scope)))
-                    .ToDictionary(key => key, key => BuildSnapshot(key.range, key.scope));
-                Volatile.Write(ref _published, snapshots);
+                if (changed || previousWarning != _directoryWarning)
+                {
+                    _needsPublish = true;
+                    var snapshots = Enum.GetValues<DashboardRange>()
+                        .SelectMany(range => Enum.GetValues<DashboardTrafficScope>().Select(scope => (range, scope)))
+                        .ToDictionary(key => key, key => BuildSnapshot(key.range, key.scope, now));
+                    Volatile.Write(ref _published, snapshots);
+                    _publishedDay = today;
+                    _needsPublish = false;
+                }
             }
         }
     }
@@ -64,7 +85,7 @@ public sealed class HistoryAnalytics
         // Protect the index and other windows from callers modifying data-bound rows.
         return new DashboardSnapshot
         {
-            Range = saved.Range, TrafficScope = saved.TrafficScope, FromUtc = saved.FromUtc, ToUtc = saved.ToUtc, FirstRecordedUtc = saved.FirstRecordedUtc,
+            Range = saved.Range, TrafficScope = saved.TrafficScope, FromUtc = saved.FromUtc, ToUtc = saved.IsLoading ? saved.ToUtc : _utcNow(), FirstRecordedUtc = saved.FirstRecordedUtc,
             UploadBytes = saved.UploadBytes, DownloadBytes = saved.DownloadBytes,
             AllUploadBytes = saved.AllUploadBytes, AllDownloadBytes = saved.AllDownloadBytes,
             ProxyUploadBytes = saved.ProxyUploadBytes, ProxyDownloadBytes = saved.ProxyDownloadBytes,
@@ -78,11 +99,10 @@ public sealed class HistoryAnalytics
         };
     }
 
-    private DashboardSnapshot BuildSnapshot(DashboardRange range, DashboardTrafficScope scope)
+    private DashboardSnapshot BuildSnapshot(DashboardRange range, DashboardTrafficScope scope, DateTime now)
     {
         lock (_gate)
         {
-            DateTime now = DateTime.UtcNow;
             DateTime today = now.ToLocalTime().Date;
             DateTime? start = range switch
             {
@@ -358,6 +378,7 @@ public sealed class HistoryAnalytics
     }
 
     private readonly record struct TargetKey(string Process, string Protocol, string Address, int Port, string Hostname, string ProxyDestination, string ProxyNode, TrafficKind TrafficKind, string ProxyType);
+    private readonly record struct SummaryStamp(long Upload, long Download, long Lost, DateTime Started, DateTime? Ended, DateTime UpdatedDay, string Status);
     private sealed class DayIndex
     {
         public long Upload, Download;
@@ -374,6 +395,12 @@ public sealed class HistoryAnalytics
         public bool LastReadClosed, IncompleteClosedTail;
         public string MetadataError = "", FlowError = "";
         public readonly Dictionary<DateTime, DayIndex> Days = new();
+        // UpdatedUtc changes with every heartbeat. Only its calendar day affects
+        // dashboard accounting, so an idle recording need not rebuild every range.
+        public (SummaryStamp Summary, long Length, long Offset, DateTime Written, bool Closed, bool Tail, string MetadataError, string FlowError, int BadLines) Stamp
+            => (new(Record?.UploadBytes ?? 0, Record?.DownloadBytes ?? 0, Record?.EventsLost ?? 0,
+                Record?.StartedUtc ?? default, Record?.EndedUtc, Record == null ? default : AsUtc(Record.UpdatedUtc).ToLocalTime().Date, Record?.Status ?? ""),
+                SeenLength, Offset, FlowWriteUtc, LastReadClosed, IncompleteClosedTail, MetadataError, FlowError, BadLines);
         public SessionIndex(string path) => Path = path;
         public void ResetFlows()
         {

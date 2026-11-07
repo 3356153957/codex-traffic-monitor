@@ -398,9 +398,21 @@ public sealed class ProcessCatalog
         {
             using var process = OpenProcess(QueryLimitedInformation, false, pid);
             if (process.IsInvalid) return ("", DateTime.MinValue);
-            var path = new StringBuilder(32768);
-            var capacity = path.Capacity;
-            var fullPath = QueryFullProcessImageNameW(process, 0, path, ref capacity) ? path.ToString() : "";
+            // Most image paths fit in 512 characters. Allocating the full 32K
+            // Windows limit for every PID on every poll creates tens of MB/sec.
+            // Retry only an insufficient buffer, retaining support for long paths.
+            string fullPath = "";
+            for (int size = 512; size <= 32768; size *= 2)
+            {
+                var path = new StringBuilder(size);
+                int capacity = path.Capacity;
+                if (QueryFullProcessImageNameW(process, 0, path, ref capacity))
+                {
+                    fullPath = path.ToString();
+                    break;
+                }
+                if (Marshal.GetLastWin32Error() != 122) break;
+            }
             var started = DateTime.MinValue;
             if (GetProcessTimes(process, out var creation, out _, out _, out _))
             {

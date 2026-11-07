@@ -159,6 +159,33 @@ public static class AnalyticsSelfTests
         Check(emptyIndex.GetSnapshot(DashboardRange.All).HasRecords && emptyIndex.GetSnapshot(DashboardRange.All).SessionCount == 1 && emptyIndex.GetSnapshot(DashboardRange.All).RecordedDays == 0,
             "A valid zero-byte session is recorded without inventing a day of traffic");
 
+        string budgetData = Path.Combine(root, "idle-budget");
+        var budgetFlows = Enumerable.Range(0, 2000).Select(i => Flow(today.AddHours(1), 1, 2, "target-" + i + ".example"));
+        string budgetSession = MakeSession(budgetData, "many-targets", budgetFlows, ended: false);
+        var budgetIndex = new HistoryAnalytics(budgetData);
+        budgetIndex.Refresh(); budgetIndex.Refresh();
+        long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 8; i++) budgetIndex.Refresh();
+        long refreshAllocation = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+        Check(refreshAllocation < 2 * 1024 * 1024 && budgetIndex.GetSnapshot(DashboardRange.All).UploadBytes == 2000,
+            "Idle history polling avoids allocations proportional to all saved targets while preserving totals");
+        allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 4; i++) { UpdateTotals(budgetSession, 2000, 4000); budgetIndex.Refresh(); }
+        Check(GC.GetAllocatedBytesForCurrentThread() - allocatedBefore < 2 * 1024 * 1024 && budgetIndex.GetSnapshot(DashboardRange.All).DownloadBytes == 4000,
+            "Recording heartbeat metadata without new bytes does not rebuild the dashboard");
+
+        DateTime clock = today.AddHours(12).ToUniversalTime();
+        var midnightIndex = new HistoryAnalytics(multi, () => clock);
+        midnightIndex.Refresh();
+        long beforeMidnight = midnightIndex.GetSnapshot(DashboardRange.Today).UploadBytes;
+        clock = clock.AddMinutes(15);
+        Check(midnightIndex.GetSnapshot(DashboardRange.Today).ToUtc == clock && midnightIndex.GetSnapshot(DashboardRange.Today).UploadBytes == beforeMidnight,
+            "Cached dashboard query time advances without changing persisted counters");
+        clock = today.AddDays(1).AddHours(12).ToUniversalTime();
+        midnightIndex.Refresh();
+        Check(beforeMidnight > 0 && midnightIndex.GetSnapshot(DashboardRange.Today).UploadBytes == 0 && midnightIndex.GetSnapshot(DashboardRange.All).UploadBytes == analytics.GetSnapshot(DashboardRange.All).UploadBytes,
+            "Unchanged cached history recomputes date ranges across local midnight");
+
         return checks;
     }
 

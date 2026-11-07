@@ -222,13 +222,13 @@ public sealed class MonitorEngine : IDisposable
         _store.Update(_ledger.UploadBytes, _ledger.DownloadBytes, _lost);
     }
 
-    public MonitorSnapshot GetSnapshot()
+    public MonitorSnapshot GetSnapshot(bool includeTargets = true)
     {
         var tracked = _catalog.List(IncludeChildren);
         lock (_gate)
         {
-            var targets = _ledger.Targets();
-            if (_startedAt == null)
+            var targets = includeTargets ? _ledger.Targets() : new List<TargetRow>();
+            if (includeTargets && _startedAt == null)
                 targets = _connections.Where(c => _catalog.IsTracked(c.Pid, IncludeChildren) && c.RemotePort != 0 && (IncludeLoopback || !IPAddress.IsLoopback(IPAddress.Parse(c.RemoteAddress))))
                     .Select(c => new TargetRow { Address = c.RemoteAddress, Port = c.RemotePort, LocalAddress = c.LocalAddress, LocalPort = c.LocalPort, Target = AddressClassifier.Endpoint(c.RemoteAddress, c.RemotePort), Process = _catalog.Get(c.Pid)?.Name ?? "未知", Pid = c.Pid, Protocol = c.Protocol, Route = AddressClassifier.Classify(IPAddress.Parse(c.RemoteAddress)) }).ToList();
             var processes = _ledger.Processes();

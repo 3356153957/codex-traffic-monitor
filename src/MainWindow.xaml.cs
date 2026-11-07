@@ -109,9 +109,16 @@ public partial class MainWindow : Window
     private void RefreshSnapshot(bool addSample)
     {
         if (_disposed) return;
+        // Collection and disk flushes run in MonitorEngine independently. A tray
+        // window only needs its icon state, not thousands of data-bound rows.
+        if (addSample && !IsVisible && !_demo)
+        {
+            _tray?.UpdateMonitoring(_engine.IsRunning);
+            return;
+        }
         try
         {
-            _snapshot = _demo ? CreateDemoSnapshot() : _engine.GetSnapshot();
+            _snapshot = _demo ? CreateDemoSnapshot() : _engine.GetSnapshot(includeTargets: false);
             _dashboard = _demo ? CreateDemoDashboard(_range, _trafficScope) : _engine.GetDashboardSnapshot(_range, _trafficScope);
             var current = _snapshot;
             var summary = _dashboard;
@@ -162,24 +169,13 @@ public partial class MainWindow : Window
             var sortedTargets = summary.Targets.OrderByDescending(row => row.UploadBytes + row.DownloadBytes).ThenBy(row => row.Hostname).ThenBy(row => row.Address).ToList();
             _targetTotalCount = sortedTargets.Count;
             string search = TargetSearchBox.Text.Trim();
-            var targets = sortedTargets.Where(row => search.Length == 0 || TargetMatches(row, search)).Select(row => new TargetDisplayRow
-            {
-                Key = TargetIdentity(row),
-                Target = TargetName(row), Address = FormatAddress(row.Address, row.Port),
-                Process = (string.IsNullOrWhiteSpace(row.Process) ? "—" : row.Process) + " · " + row.Protocol,
-                Details = "直接连接：" + FormatAddress(row.Address, row.Port) + "  ·  " + row.Process + " / " + row.Protocol + "\n流量路径：" + TrafficKindLabel(row.TrafficKind) + " · " + row.TrafficKindSource + (!string.IsNullOrWhiteSpace(row.DomainSource) ? "\n域名来源：" + row.DomainSource : "") + (!string.IsNullOrEmpty(row.ProxyDestination) ? "\n代理报告目标：" + row.ProxyDestination : "") + "\n地区 / 网络：" + ConnectionPresentation.RegionLabel(row) + "  ·  连接：" + DisplayRoute(row) + "\n地区依据：" + ConnectionPresentation.RegionDetails(row) + "\n代理节点：" + ConnectionPresentation.NodeLabel(row) + "\n节点依据：" + ConnectionPresentation.NodeDetails(row) + (!string.IsNullOrEmpty(row.ProxyChain) ? "\n完整代理链：" + row.ProxyChain : ""),
-                Protocol = row.Protocol, Route = ShortTrafficKindLabel(row.TrafficKind) + " · " + DisplayRoute(row),
-                Region = ConnectionPresentation.RegionLabel(row),
-                ProxyNode = ConnectionPresentation.NodeLabel(row),
-                ProxyContext = ConnectionPresentation.NodeContext(row),
-                UploadBytes = row.UploadBytes, DownloadBytes = row.DownloadBytes,
-                UploadDisplay = Bytes(row.UploadBytes), DownloadDisplay = Bytes(row.DownloadBytes), TotalDisplay = Bytes(row.UploadBytes + row.DownloadBytes)
-            }).ToList();
+            var targets = sortedTargets.Where(row => search.Length == 0 || TargetMatches(row, search))
+                .Select(row => new TargetDisplayRow { Source = row }).ToList();
             _refreshingTargets = true;
             try
             {
                 SetGridItems(TargetsGrid, targets);
-                TargetsGrid.SelectedItem = targets.FirstOrDefault(row => row.Key == _selectedTargetKey);
+                TargetsGrid.SelectedItem = _selectedTargetKey == null ? null : targets.FirstOrDefault(row => row.Key == _selectedTargetKey);
             }
             finally { _refreshingTargets = false; }
             UpdateTargetDetails();
@@ -194,7 +190,10 @@ public partial class MainWindow : Window
                 StartedAt = row.StartedAt, Duration = row.Duration, UploadBytes = row.UploadBytes, DownloadBytes = row.DownloadBytes,
                 UploadDisplay = Bytes(row.UploadBytes), DownloadDisplay = Bytes(row.DownloadBytes), TotalDisplay = Bytes(row.UploadBytes + row.DownloadBytes)
             }).ToList());
-            var destinations = sortedTargets.GroupBy(TargetName).Select(group => new { Name = group.Key, Bytes = group.Sum(row => row.UploadBytes + row.DownloadBytes), Details = string.Join("\n", group.Select(row => FormatAddress(row.Address, row.Port)).Distinct().Take(8)) }).OrderByDescending(row => row.Bytes).Take(5).ToList();
+            var destinations = sortedTargets.GroupBy(TargetName)
+                .Select(group => new { Name = group.Key, Bytes = group.Sum(row => row.UploadBytes + row.DownloadBytes), Rows = group })
+                .OrderByDescending(row => row.Bytes).Take(5)
+                .Select(row => new { row.Name, row.Bytes, Details = string.Join("\n", row.Rows.Select(target => FormatAddress(target.Address, target.Port)).Distinct().Take(8)) }).ToList();
             double rankMaximum = destinations.Count == 0 ? 1 : Math.Max(1, destinations[0].Bytes);
             RankingList.ItemsSource = destinations.Select((row, index) => new RankingDisplayRow { Rank = (index + 1).ToString(), Name = row.Name, Details = row.Details + "\n占当前范围 " + (total > 0 ? row.Bytes * 100d / total : 0).ToString("0.0") + "% · 点击筛选", Display = Bytes(row.Bytes), UsedWidth = new GridLength(Math.Max(.001, row.Bytes / rankMaximum), GridUnitType.Star), RemainingWidth = new GridLength(Math.Max(.001, 1 - row.Bytes / rankMaximum), GridUnitType.Star) }).ToList();
             RankingEmptyText.Visibility = destinations.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
@@ -530,6 +529,7 @@ public partial class MainWindow : Window
         ShowInTaskbar = true;
         Show();
         WindowState = WindowState.Normal;
+        RefreshSnapshot(false);
         Activate();
     }
 
@@ -712,22 +712,26 @@ public partial class MainWindow : Window
 
     private sealed class TargetDisplayRow
     {
-        public string Key { get; init; } = "";
-        public string Target { get; init; } = "";
-        public string Details { get; init; } = "";
-        public string Address { get; init; } = "";
-        public string Process { get; init; } = "";
-        public string Protocol { get; init; } = "";
-        public string Route { get; init; } = "";
-        public string Region { get; init; } = "";
-        public string ProxyNode { get; init; } = "";
-        public string ProxyContext { get; init; } = "";
-        public long UploadBytes { get; init; }
-        public long DownloadBytes { get; init; }
+        public required TargetRow Source { get; init; }
+        private string? _key, _details;
+        public string Key => _key ??= TargetIdentity(Source);
+        public string Target => TargetName(Source);
+        // DataGrid virtualizes rows. Format only realized cells and requested
+        // details instead of eagerly building strings for the entire history.
+        public string Details => _details ??= "直接连接：" + Address + "  ·  " + Source.Process + " / " + Protocol + "\n流量路径：" + TrafficKindLabel(Source.TrafficKind) + " · " + Source.TrafficKindSource + (!string.IsNullOrWhiteSpace(Source.DomainSource) ? "\n域名来源：" + Source.DomainSource : "") + (!string.IsNullOrEmpty(Source.ProxyDestination) ? "\n代理报告目标：" + Source.ProxyDestination : "") + "\n地区 / 网络：" + Region + "  ·  连接：" + DisplayRoute(Source) + "\n地区依据：" + ConnectionPresentation.RegionDetails(Source) + "\n代理节点：" + ProxyNode + "\n节点依据：" + ConnectionPresentation.NodeDetails(Source) + (!string.IsNullOrEmpty(Source.ProxyChain) ? "\n完整代理链：" + Source.ProxyChain : "");
+        public string Address => FormatAddress(Source.Address, Source.Port);
+        public string Process => (string.IsNullOrWhiteSpace(Source.Process) ? "—" : Source.Process) + " · " + Protocol;
+        public string Protocol => Source.Protocol;
+        public string Route => ShortTrafficKindLabel(Source.TrafficKind) + " · " + DisplayRoute(Source);
+        public string Region => ConnectionPresentation.RegionLabel(Source);
+        public string ProxyNode => ConnectionPresentation.NodeLabel(Source);
+        public string ProxyContext => ConnectionPresentation.NodeContext(Source);
+        public long UploadBytes => Source.UploadBytes;
+        public long DownloadBytes => Source.DownloadBytes;
         public long TotalBytes => UploadBytes + DownloadBytes;
-        public string UploadDisplay { get; init; } = "";
-        public string DownloadDisplay { get; init; } = "";
-        public string TotalDisplay { get; init; } = "";
+        public string UploadDisplay => Bytes(UploadBytes);
+        public string DownloadDisplay => Bytes(DownloadBytes);
+        public string TotalDisplay => Bytes(TotalBytes);
     }
     private sealed class ProcessDisplayRow
     {

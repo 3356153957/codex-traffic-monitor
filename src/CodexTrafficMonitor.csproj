@@ -11,7 +11,7 @@
     <StartupObject>CodexTraffic.Program</StartupObject>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
-    <Version>1.3.0</Version>
+    <Version>1.3.1</Version>
     <Authors>3356153957</Authors>
     <RepositoryUrl>https://github.com/3356153957/codex-traffic-monitor</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
