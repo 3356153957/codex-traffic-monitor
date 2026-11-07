@@ -73,7 +73,15 @@ public sealed class SessionStore : IDisposable
             try
             {
                 var r = JsonSerializer.Deserialize<SessionRecord>(File.ReadAllText(Path.Combine(path, "session.json")));
-                if (r == null) continue;
+                if (r == null || r.StartedUtc == default || r.UploadBytes < 0 || r.DownloadBytes < 0) continue;
+                // Use the same validity rules as the dashboard history index.
+                // Corrupt version-two counters must not show a combined total in
+                // one view and different application totals in another. Decimal
+                // comparison also rejects sums that exceed the Int64 range.
+                if (r.AccountingVersion >= 2 && (r.CodexUploadBytes < 0 || r.CodexDownloadBytes < 0 ||
+                    r.ClaudeUploadBytes < 0 || r.ClaudeDownloadBytes < 0 ||
+                    (decimal)r.CodexUploadBytes + r.ClaudeUploadBytes != r.UploadBytes ||
+                    (decimal)r.CodexDownloadBytes + r.ClaudeDownloadBytes != r.DownloadBytes)) continue;
                 var duration = (r.EndedUtc ?? r.UpdatedUtc) - r.StartedUtc;
                 result.Add(new SessionRow { AccountingVersion = r.AccountingVersion,
                     CodexUploadBytes = r.AccountingVersion >= 2 ? r.CodexUploadBytes : r.UploadBytes,

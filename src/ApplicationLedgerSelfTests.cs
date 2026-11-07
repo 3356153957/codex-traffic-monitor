@@ -96,6 +96,51 @@ public static class ApplicationLedgerSelfTests
         Check(legacyRow.CodexUploadBytes == 7 && legacyRow.CodexDownloadBytes == 11 && legacyRow.ClaudeUploadBytes == 0 && legacyRow.ClaudeDownloadBytes == 0,
             "Pre-Claude session summaries remain Codex-only in session-history rows");
 
+        string invalidHistory = Path.Combine(data, "invalid-history");
+        void SummaryFixture(string id, object record)
+        {
+            string directory = Path.Combine(invalidHistory, "sessions", id); Directory.CreateDirectory(directory);
+            File.WriteAllText(Path.Combine(directory, "session.json"), JsonSerializer.Serialize(record));
+        }
+        SessionRecord ValidSummary() => new()
+        {
+            AccountingVersion = 2, StartedUtc = now, UpdatedUtc = now, EndedUtc = now, Status = "completed",
+            UploadBytes = 32, DownloadBytes = 40, CodexUploadBytes = 13, ClaudeUploadBytes = 19,
+            CodexDownloadBytes = 17, ClaudeDownloadBytes = 23
+        };
+        var badUpload = ValidSummary(); badUpload.CodexUploadBytes++;
+        var badDownload = ValidSummary(); badDownload.ClaudeDownloadBytes++;
+        SummaryFixture("bad-upload", badUpload); SummaryFixture("bad-download", badDownload);
+        SummaryFixture("missing-application-fields", new
+        { AccountingVersion = 2, StartedUtc = now, UpdatedUtc = now, UploadBytes = 32, DownloadBytes = 40 });
+        Check(SessionStore.History(invalidHistory).Count == 0,
+            "Session-history rejects mismatched directional totals and missing version-two application counters instead of guessing ownership");
+        var negativeCodexUp = ValidSummary(); negativeCodexUp.CodexUploadBytes = -1; negativeCodexUp.ClaudeUploadBytes = 33;
+        var negativeClaudeUp = ValidSummary(); negativeClaudeUp.ClaudeUploadBytes = -1; negativeClaudeUp.CodexUploadBytes = 33;
+        var negativeCodexDown = ValidSummary(); negativeCodexDown.CodexDownloadBytes = -1; negativeCodexDown.ClaudeDownloadBytes = 41;
+        var negativeClaudeDown = ValidSummary(); negativeClaudeDown.ClaudeDownloadBytes = -1; negativeClaudeDown.CodexDownloadBytes = 41;
+        SummaryFixture("negative-codex-up", negativeCodexUp); SummaryFixture("negative-claude-up", negativeClaudeUp);
+        SummaryFixture("negative-codex-down", negativeCodexDown); SummaryFixture("negative-claude-down", negativeClaudeDown);
+        Check(SessionStore.History(invalidHistory).Count == 0,
+            "Session-history rejects each negative application counter even when the directional application sums match");
+        var oversizedSum = ValidSummary(); oversizedSum.CodexUploadBytes = long.MaxValue; oversizedSum.ClaudeUploadBytes = long.MaxValue;
+        var negativeTotal = ValidSummary(); negativeTotal.UploadBytes = -32;
+        var noStart = ValidSummary(); noStart.StartedUtc = default;
+        SummaryFixture("overflowing-sum", oversizedSum); SummaryFixture("negative-total", negativeTotal); SummaryFixture("missing-start", noStart);
+        string overflowDirectory = Path.Combine(invalidHistory, "sessions", "overflowing-value"); Directory.CreateDirectory(overflowDirectory);
+        File.WriteAllText(Path.Combine(overflowDirectory, "session.json"), JsonSerializer.Serialize(ValidSummary()).Replace("\"UploadBytes\":32", "\"UploadBytes\":9223372036854775808", StringComparison.Ordinal));
+        Check(SessionStore.History(invalidHistory).Count == 0,
+            "Corrupt session totals, dates, out-of-range numeric values and overflowing application sums are skipped without throwing");
+        SummaryFixture("valid-v2", ValidSummary());
+        SummaryFixture("valid-zero-v2", new SessionRecord { AccountingVersion = 2, StartedUtc = now, UpdatedUtc = now });
+        SummaryFixture("valid-legacy", new SessionRecord { StartedUtc = now, UpdatedUtc = now, UploadBytes = 7, DownloadBytes = 11, ClaudeUploadBytes = 999 });
+        var validHistory = SessionStore.History(invalidHistory);
+        Check(validHistory.Count == 3 && validHistory.Single(r => Path.GetFileName(r.Path) == "valid-v2").ClaudeDownloadBytes == 23 &&
+            validHistory.Single(r => Path.GetFileName(r.Path) == "valid-zero-v2").UploadBytes == 0 &&
+            validHistory.Single(r => Path.GetFileName(r.Path) == "valid-legacy").CodexUploadBytes == 7 &&
+            validHistory.Single(r => Path.GetFileName(r.Path) == "valid-legacy").ClaudeUploadBytes == 0,
+            "Skipping corrupt session summaries preserves valid split totals, zero-byte sessions and legacy Codex ownership");
+
         string csvPath = Path.Combine(data, "application.csv");
         var export = ledger.Targets();
         export.Single(t => t.Application == TrackedApplication.Claude).Process = "=UNTRUSTED()";

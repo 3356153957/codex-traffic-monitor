@@ -53,6 +53,7 @@ public partial class MainWindow : Window
     private string? _selectedTargetKey;
     private int _targetTotalCount;
     private TrayController? _tray;
+    private WindowState _restoreWindowState = WindowState.Normal;
     private string _selectedTab = "targets";
     public string? PreviewOutputPath { get; set; }
     public bool StartHidden { get; set; }
@@ -80,6 +81,7 @@ public partial class MainWindow : Window
         StateChanged += (_, _) =>
         {
             if (!_demo && string.IsNullOrWhiteSpace(PreviewOutputPath) && WindowState == WindowState.Minimized) HideToTray();
+            else if (WindowState != WindowState.Minimized) _restoreWindowState = WindowState;
         };
         Activated += async (_, _) =>
         {
@@ -599,6 +601,8 @@ public partial class MainWindow : Window
     private void HideToTray(bool notify = true)
     {
         if (_tray == null) return;
+        if (WindowState != WindowState.Minimized) _restoreWindowState = WindowState;
+        SettingsPopup.IsOpen = false;
         ShowInTaskbar = false;
         Hide();
         if (notify) _tray.NotifyHidden(_engine.IsRunning);
@@ -608,9 +612,11 @@ public partial class MainWindow : Window
     {
         if (_disposed) return;
         if (!Dispatcher.CheckAccess()) { Dispatcher.BeginInvoke(new Action(RestoreFromTray)); return; }
+        _tray?.DismissHiddenNotification();
+        var restoreState = _restoreWindowState;
         ShowInTaskbar = true;
         Show();
-        WindowState = WindowState.Normal;
+        WindowState = restoreState;
         RefreshSnapshot(false);
         Activate();
     }

@@ -12,6 +12,18 @@
         <ResourceDictionary.MergedDictionaries><ResourceDictionary Source="Assets/Icons.xaml" /></ResourceDictionary.MergedDictionaries>
         <Thickness x:Key="RankingRowMargin">0,3,0,3</Thickness>
         <SolidColorBrush x:Key="Muted" Color="#667B8B" />
+        <Style x:Key="CaptionToolTip" TargetType="ToolTip">
+            <Setter Property="Background" Value="#203443" /><Setter Property="Foreground" Value="White" />
+            <Setter Property="BorderBrush" Value="#364C5C" /><Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Padding" Value="13,10" /><Setter Property="Placement" Value="Bottom" />
+            <Setter Property="VerticalOffset" Value="7" /><Setter Property="MaxWidth" Value="285" />
+            <Setter Property="HasDropShadow" Value="False" /><Setter Property="UseLayoutRounding" Value="True" />
+            <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ToolTip">
+                <Border CornerRadius="9" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}">
+                    <ContentPresenter />
+                </Border>
+            </ControlTemplate></Setter.Value></Setter>
+        </Style>
         <Style x:Key="NumericText" TargetType="TextBlock"><Setter Property="HorizontalAlignment" Value="Right" /><Setter Property="FontFamily" Value="Segoe UI" /></Style>
         <Style x:Key="NumericHeader" TargetType="DataGridColumnHeader"><Setter Property="Background" Value="#F8FAFB" /><Setter Property="Foreground" Value="#667B8B" /><Setter Property="FontSize" Value="11" /><Setter Property="FontWeight" Value="Normal" /><Setter Property="BorderThickness" Value="0,0,0,1" /><Setter Property="BorderBrush" Value="#E9EDF1" /><Setter Property="Padding" Value="14,0" /><Setter Property="HorizontalContentAlignment" Value="Right" /></Style>
         <Style TargetType="Button">
@@ -39,6 +51,7 @@
         </Style>
         <Style x:Key="CaptionButton" TargetType="Button">
             <Setter Property="Width" Value="46" /><Setter Property="Height" Value="38" /><Setter Property="Padding" Value="0" /><Setter Property="BorderThickness" Value="0" /><Setter Property="Background" Value="Transparent" /><Setter Property="Foreground" Value="#516674" /><Setter Property="shell:WindowChrome.IsHitTestVisibleInChrome" Value="True" /><Setter Property="Focusable" Value="False" />
+            <Setter Property="ToolTipService.InitialShowDelay" Value="550" /><Setter Property="ToolTipService.ShowDuration" Value="6500" />
             <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><Border x:Name="CaptionButtonBorder" Background="{TemplateBinding Background}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" /></Border><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="CaptionButtonBorder" Property="Background" Value="#E4EAF0" /></Trigger><Trigger Property="IsPressed" Value="True"><Setter TargetName="CaptionButtonBorder" Property="Background" Value="#D6E0E8" /></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
         </Style>
         <Style x:Key="CaptionCloseButton" TargetType="Button" BasedOn="{StaticResource CaptionButton}">
@@ -68,16 +81,24 @@
                     <Grid>
                         <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="14,0,0,0"><Image Source="{StaticResource AppMark}" Width="20" Height="20" Margin="0,0,9,0" /><TextBlock Text="{TemplateBinding Title}" Foreground="#526875" FontSize="11" VerticalAlignment="Center" /></StackPanel>
                         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-                            <Button x:Name="CaptionMinimizeButton" Style="{StaticResource CaptionButton}" Click="CaptionMinimize_Click" ToolTip="最小化到托盘" AutomationProperties.Name="最小化到托盘"><Path Data="M 0,6 L 10,6" Width="10" Height="12" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.1" /></Button>
-                            <Button x:Name="CaptionMaximizeButton" Style="{StaticResource CaptionButton}" Click="CaptionMaximize_Click" ToolTip="最大化或还原" AutomationProperties.Name="最大化或还原"><Path x:Name="MaximizeSymbol" Data="M 1,1 L 11,1 L 11,11 L 1,11 Z" Width="12" Height="12" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.1" /></Button>
-                            <Button x:Name="CaptionCloseButton" Style="{StaticResource CaptionCloseButton}" Click="CaptionClose_Click" ToolTip="收起到托盘，继续记录" AutomationProperties.Name="收起到托盘" />
+                            <Button x:Name="CaptionMinimizeButton" Style="{StaticResource CaptionButton}" Click="CaptionMinimize_Click" AutomationProperties.Name="最小化到托盘">
+                                <Button.ToolTip><ToolTip Style="{StaticResource CaptionToolTip}"><StackPanel><TextBlock Text="收起到托盘" FontSize="12" FontWeight="SemiBold" /><TextBlock Text="保留当前监控状态，双击托盘图标恢复窗口" FontSize="11" Foreground="#CAD7E0" Margin="0,5,0,0" TextWrapping="Wrap" /></StackPanel></ToolTip></Button.ToolTip>
+                                <Path Data="M 0,6 L 10,6" Width="10" Height="12" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.1" />
+                            </Button>
+                            <Button x:Name="CaptionMaximizeButton" Style="{StaticResource CaptionButton}" Click="CaptionMaximize_Click" Tag="最大化" AutomationProperties.Name="{Binding Tag, RelativeSource={RelativeSource Self}}">
+                                <Button.ToolTip><ToolTip Style="{StaticResource CaptionToolTip}"><StackPanel><TextBlock Text="{Binding PlacementTarget.Tag, RelativeSource={RelativeSource AncestorType=ToolTip}}" FontSize="12" FontWeight="SemiBold" /><TextBlock Text="双击标题栏也可切换窗口大小" FontSize="11" Foreground="#CAD7E0" Margin="0,5,0,0" TextWrapping="Wrap" /></StackPanel></ToolTip></Button.ToolTip>
+                                <Path x:Name="MaximizeSymbol" Data="M 1,1 L 11,1 L 11,11 L 1,11 Z" Width="12" Height="12" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.1" />
+                            </Button>
+                            <Button x:Name="CaptionCloseButton" Style="{StaticResource CaptionCloseButton}" Click="CaptionClose_Click" AutomationProperties.Name="收起到托盘">
+                                <Button.ToolTip><ToolTip Style="{StaticResource CaptionToolTip}"><StackPanel><TextBlock Text="收起到托盘" FontSize="12" FontWeight="SemiBold" /><TextBlock Text="双击托盘图标恢复；结束程序请使用托盘菜单" FontSize="11" Foreground="#CAD7E0" Margin="0,5,0,0" TextWrapping="Wrap" /></StackPanel></ToolTip></Button.ToolTip>
+                            </Button>
                         </StackPanel>
                     </Grid>
                 </Border>
                 <AdornerDecorator Grid.Row="1"><ContentPresenter Content="{TemplateBinding Content}" /></AdornerDecorator>
             </Grid>
         </Border>
-        <ControlTemplate.Triggers><Trigger Property="WindowState" Value="Maximized"><Setter TargetName="WindowFrame" Property="CornerRadius" Value="0" /><Setter TargetName="CaptionBar" Property="CornerRadius" Value="0" /><Setter TargetName="MaximizeSymbol" Property="Data" Value="M 4,1 L 11,1 L 11,8 M 1,4 L 8,4 L 8,11 L 1,11 Z" /></Trigger><Trigger Property="IsActive" Value="False"><Setter TargetName="WindowFrame" Property="BorderBrush" Value="#E0E5EA" /></Trigger></ControlTemplate.Triggers>
+        <ControlTemplate.Triggers><Trigger Property="WindowState" Value="Maximized"><Setter TargetName="WindowFrame" Property="CornerRadius" Value="0" /><Setter TargetName="CaptionBar" Property="CornerRadius" Value="0" /><Setter TargetName="CaptionMaximizeButton" Property="Tag" Value="还原窗口" /><Setter TargetName="MaximizeSymbol" Property="Data" Value="M 4,1 L 11,1 L 11,8 M 1,4 L 8,4 L 8,11 L 1,11 Z" /></Trigger><Trigger Property="IsActive" Value="False"><Setter TargetName="WindowFrame" Property="BorderBrush" Value="#E0E5EA" /></Trigger></ControlTemplate.Triggers>
     </ControlTemplate></Window.Template>
     <Grid Margin="28,20,28,14">
         <Grid.RowDefinitions><RowDefinition Height="64" /><RowDefinition Height="42" /><RowDefinition Height="124" /><RowDefinition Height="212" /><RowDefinition Height="32" /><RowDefinition Height="*" /><RowDefinition Height="36" /></Grid.RowDefinitions>
