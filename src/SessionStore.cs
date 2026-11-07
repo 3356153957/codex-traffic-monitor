@@ -1,0 +1,95 @@
+using System.Globalization;
+using System.IO;
+using System.Text;
+using System.Text.Json;
+
+namespace CodexTraffic;
+
+public sealed class SessionStore : IDisposable
+{
+    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    private readonly FileStream _flowStream;
+    public string DirectoryPath { get; }
+    public string LogFile => Path.Combine(DirectoryPath, "flows.jsonl");
+    public SessionRecord Record { get; }
+
+    public SessionStore(string dataDirectory, bool children, bool loopback)
+    {
+        var now = DateTime.UtcNow;
+        string id = now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture) + "-" + Guid.NewGuid().ToString("N")[..8];
+        DirectoryPath = Path.Combine(dataDirectory, "sessions", id);
+        Directory.CreateDirectory(DirectoryPath);
+        Record = new SessionRecord { Id = id, StartedUtc = now, UpdatedUtc = now, IncludeChildren = children, IncludeLoopback = loopback };
+        _flowStream = new FileStream(LogFile, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read);
+        _flowStream.Position = _flowStream.Length;
+        try { Update(0, 0, 0); }
+        catch { _flowStream.Dispose(); throw; }
+    }
+
+    public void Append(IEnumerable<FlowRecord> rows)
+    {
+        string block = string.Join("\n", rows.Select(row => JsonSerializer.Serialize(row)));
+        if (block.Length == 0) return;
+        byte[] bytes = Encoding.UTF8.GetBytes(block + "\n");
+        long checkpoint = _flowStream.Position;
+        try { _flowStream.Write(bytes); _flowStream.Flush(true); }
+        catch
+        {
+            try { _flowStream.SetLength(checkpoint); _flowStream.Position = checkpoint; } catch { }
+            throw;
+        }
+    }
+
+    public void Update(long up, long down, long lost, string? error = null, bool ended = false)
+    {
+        Record.UpdatedUtc = DateTime.UtcNow;
+        Record.UploadBytes = up;
+        Record.DownloadBytes = down;
+        Record.EventsLost = lost;
+        if (error != null) { Record.Error = error; Record.Status = "error"; }
+        if (ended) { Record.EndedUtc = Record.UpdatedUtc; if (Record.Status != "error") Record.Status = "completed"; }
+        string file = Path.Combine(DirectoryPath, "session.json");
+        string temporary = file + ".tmp";
+        File.WriteAllText(temporary, JsonSerializer.Serialize(Record, JsonOptions), new UTF8Encoding(false));
+        File.Move(temporary, file, true);
+    }
+
+    public static List<SessionRow> History(string dataDirectory, string? excludedId = null)
+    {
+        string directory = Path.Combine(dataDirectory, "sessions");
+        if (!Directory.Exists(directory)) return new();
+        var result = new List<SessionRow>();
+        foreach (var path in Directory.EnumerateDirectories(directory).OrderByDescending(x => x).Take(100))
+        {
+            if (Path.GetFileName(path) == excludedId) continue;
+            try
+            {
+                var r = JsonSerializer.Deserialize<SessionRecord>(File.ReadAllText(Path.Combine(path, "session.json")));
+                if (r == null) continue;
+                var duration = (r.EndedUtc ?? r.UpdatedUtc) - r.StartedUtc;
+                result.Add(new SessionRow { StartedAt = r.StartedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"), Duration = $"{(int)duration.TotalHours:00}:{duration.Minutes:00}:{duration.Seconds:00}" + (r.Status == "recording" ? "（未正常结束）" : r.Status == "error" ? "（采集异常）" : ""), UploadBytes = r.UploadBytes, DownloadBytes = r.DownloadBytes, Path = path });
+            }
+            catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException) { }
+        }
+        return result;
+    }
+
+    public static void WriteCsv(string path, IEnumerable<TargetRow> rows)
+    {
+        using var writer = new StreamWriter(path, false, new UTF8Encoding(true));
+        writer.WriteLine("Process,PID,Protocol,LocalAddress,LocalPort,RemoteAddress,RemotePort,Route,UploadBytes,DownloadBytes,LastSeenLocal,DomainHint,DomainSource,ProxyReportedDestination,ProxyChain,ProxyNode,Region,RegionSource,TrafficKind,ProxyType,TrafficKindSource");
+        foreach (var row in rows)
+        {
+            TrafficClassifier.Apply(row);
+            writer.WriteLine(string.Join(",", new[] { SafeCsv(row.Process), row.Pid.ToString(CultureInfo.InvariantCulture), SafeCsv(row.Protocol), SafeCsv(row.LocalAddress), row.LocalPort.ToString(CultureInfo.InvariantCulture), SafeCsv(row.Address), row.Port.ToString(CultureInfo.InvariantCulture), SafeCsv(row.Route), row.UploadBytes.ToString(CultureInfo.InvariantCulture), row.DownloadBytes.ToString(CultureInfo.InvariantCulture), SafeCsv(row.LastSeen.ToString("O", CultureInfo.InvariantCulture)), SafeCsv(row.Hostname), SafeCsv(row.DomainSource), SafeCsv(row.ProxyDestination), SafeCsv(row.ProxyChain), SafeCsv(row.ProxyNode), SafeCsv(row.Region), SafeCsv(row.RegionSource), SafeCsv(row.TrafficKind.ToString()), SafeCsv(row.ProxyType), SafeCsv(row.TrafficKindSource) }));
+        }
+    }
+
+    private static string SafeCsv(string value)
+    {
+        // Excel treats formula prefixes specially even inside quoted CSV cells.
+        if (value.Length > 0 && "=+-@\t\r".Contains(value[0])) value = "'" + value;
+        return "\"" + value.Replace("\"", "\"\"") + "\"";
+    }
+    public void Dispose() => _flowStream.Dispose();
+}

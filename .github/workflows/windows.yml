@@ -1,0 +1,39 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: 8.0.x
+      - name: Verify release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $project = [xml](Get-Content ./src/CodexTrafficMonitor.csproj -Raw)
+          if ($env:GITHUB_REF_NAME -ne "v$($project.Project.PropertyGroup.Version)") { throw 'Tag and application version differ.' }
+      - name: Build, self-test, and package
+        shell: pwsh
+        run: ./build-release.ps1 -OutputDirectory "$env:RUNNER_TEMP/codex-traffic-release"
+      - name: Upload installer and portable package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-x64
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/codex-traffic-release/*.exe
+            ${{ runner.temp }}/codex-traffic-release/*.zip
+            ${{ runner.temp }}/codex-traffic-release/SHA256SUMS.txt
