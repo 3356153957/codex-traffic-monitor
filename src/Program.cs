@@ -78,10 +78,25 @@ public static class Program
                 e.Handled = true;
             };
             if (livePreview) Thread.Sleep(2200);
-            var window = new MainWindow(monitor, preview) { StartHidden = args.Contains("--minimized") && !anyPreview };
+            var window = new MainWindow(monitor, preview);
             instance?.Attach(window);
             if (preview || livePreview) window.PreviewOutputPath = Path.GetFullPath(ValueAfter(args, livePreview ? "--preview-live" : "--preview") ?? "preview.png");
-            if (args.Contains("--start") && !preview) window.Loaded += (_, _) => monitor.Start();
+            if (args.Contains("--minimized") && !anyPreview)
+            {
+                app.MainWindow = window;
+                app.Startup += (_, _) =>
+                {
+                    window.InitializeInTray();
+                    if (args.Contains("--start")) monitor.Start();
+                    instance?.ApplyPendingRequests();
+                };
+                return app.Run();
+            }
+            if (args.Contains("--start") && !preview)
+            {
+                bool started = false;
+                window.Loaded += (_, _) => { if (!started) { started = true; monitor.Start(); } };
+            }
             return app.Run(window);
         }
         catch (Exception e)

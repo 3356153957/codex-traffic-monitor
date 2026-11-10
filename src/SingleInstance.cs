@@ -54,7 +54,17 @@ public sealed class SingleInstance : IDisposable
                 return IntPtr.Zero;
             });
         };
-        window.Loaded += (_, _) => { if (_exitRequested) window.RequestExit(); else if (_showRequested) window.RestoreFromTray(); };
+        window.Loaded += (_, _) => ApplyPendingRequests();
+    }
+
+    internal void ApplyPendingRequests()
+    {
+        if (_exitRequested) _window?.RequestExit();
+        else if (_showRequested)
+        {
+            _showRequested = false;
+            _window?.RestoreFromTray();
+        }
     }
 
     private async Task Listen()
@@ -70,7 +80,7 @@ public sealed class SingleInstance : IDisposable
                 if (Encoding.ASCII.GetString(message) == "show")
                 {
                     _showRequested = true;
-                    _window?.Dispatcher.BeginInvoke(new Action(() => _window.RestoreFromTray()));
+                    _window?.Dispatcher.BeginInvoke(new Action(ApplyPendingRequests));
                 }
             }
             catch (OperationCanceledException) { break; }

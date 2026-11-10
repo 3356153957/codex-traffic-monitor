@@ -13,6 +13,7 @@ using System.Windows.Data;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Threading;
 using Microsoft.Win32;
 using Application = System.Windows.Application;
@@ -56,7 +57,6 @@ public partial class MainWindow : Window
     private WindowState _restoreWindowState = WindowState.Normal;
     private string _selectedTab = "targets";
     public string? PreviewOutputPath { get; set; }
-    public bool StartHidden { get; set; }
 
     public MainWindow(MonitorEngine engine, bool demo = false)
     {
@@ -94,15 +94,7 @@ public partial class MainWindow : Window
     private async void Window_Loaded(object sender, RoutedEventArgs e)
     {
         RefreshSnapshot(false);
-        if (!_demo) _timer.Start();
-        _windowLoaded = true;
-        if (!_demo && string.IsNullOrWhiteSpace(PreviewOutputPath))
-        {
-            _tray = new TrayController(Dispatcher, RestoreFromTray, ToggleMonitoring, RequestExit);
-            _tray.UpdateMonitoring(_engine.IsRunning);
-            if (StartHidden) HideToTray(false);
-            await RefreshStartupStatusAsync();
-        }
+        await InitializeRuntimeAsync();
         if (!string.IsNullOrWhiteSpace(PreviewOutputPath))
         {
             _ = Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, new Action(() =>
@@ -111,6 +103,28 @@ public partial class MainWindow : Window
                 catch (Exception exception) { Trace.WriteLine("Preview: " + exception.Message); }
                 finally { Application.Current.Shutdown(); }
             }));
+        }
+    }
+
+    internal void InitializeInTray()
+    {
+        // Never show the main HWND during login. Hiding inside Loaded can leave
+        // a visible, unpainted window when WPF finishes its initial Show call.
+        ShowInTaskbar = false;
+        new WindowInteropHelper(this).EnsureHandle();
+        _ = InitializeRuntimeAsync();
+    }
+
+    private async Task InitializeRuntimeAsync()
+    {
+        if (_windowLoaded) return;
+        _windowLoaded = true;
+        if (!_demo) _timer.Start();
+        if (!_demo && string.IsNullOrWhiteSpace(PreviewOutputPath))
+        {
+            _tray = new TrayController(Dispatcher, RestoreFromTray, ToggleMonitoring, RequestExit);
+            _tray.UpdateMonitoring(_engine.IsRunning);
+            await RefreshStartupStatusAsync();
         }
     }
 
