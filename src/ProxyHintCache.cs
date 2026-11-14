@@ -18,6 +18,7 @@ internal sealed class ProxyHintCache
     private const int MaximumEntries = 16384;
     private readonly object _gate = new();
     private Entry[] _entries = Array.Empty<Entry>();
+    private DateTime _lastSnapshotUtc;
 
     public void Update(IEnumerable<ProxyConnectionHint> snapshot, DateTime observedUtc)
     {
@@ -35,12 +36,13 @@ internal sealed class ProxyHintCache
                 bool hasLifetime = HasLifetime(connection);
                 Entry[] versions = hasLifetime && byLifetime.TryGetValue((connection.Identity, connection.StartedUtc), out var found)
                     ? found : Array.Empty<Entry>();
-                var matching = versions.FirstOrDefault(e => SameTarget(e.Connection, connection));
+                var matching = versions.FirstOrDefault(e => e.MissingUtc == null && SameTarget(e.Connection, connection));
                 // If metadata changes within a connection, do not apply the new
                 // target/chain to events from before that version was observed.
-                bool changed = versions.Any(e => !SameTarget(e.Connection, connection));
+                bool changed = versions.Length > 0 && matching == null;
+                bool absentBefore = _lastSnapshotUtc != default && connection.StartedUtc < _lastSnapshotUtc;
                 DateTime validFrom = matching?.ValidFromUtc ??
-                    (changed ? observedUtc : connection.StartedUtc ?? observedUtc);
+                    (changed || absentBefore ? observedUtc : connection.StartedUtc ?? observedUtc);
                 if (matching != null) retained.Add(matching);
                 next.Add(new Entry(connection, validFrom, null));
             }
@@ -53,16 +55,20 @@ internal sealed class ProxyHintCache
             }
             Volatile.Write(ref _entries, next.OrderByDescending(e => e.MissingUtc == null)
                 .ThenByDescending(e => e.Connection.Hint.ObservedUtc).Take(MaximumEntries).ToArray());
+            _lastSnapshotUtc = observedUtc;
         }
     }
 
     public ProxyHint? Lookup(int pid, string localAddress, int localPort, string remoteAddress, int remotePort,
-        DateTime nowUtc, DateTime? observedAtUtc, Func<int, string, string, bool> matchesProcess)
+        DateTime nowUtc, DateTime? observedAtUtc, Func<int, string, string, bool> matchesProcess,
+        DateTime? observedUntilUtc = null)
     {
         if (localPort is < 1 or > 65535 || !TryAddress(localAddress, out var local) ||
             !TryAddress(remoteAddress, out var remote)) return null;
         DateTime? eventUtc = observedAtUtc?.ToUniversalTime();
-        if (eventUtc.HasValue && !IsFresh(eventUtc.Value, nowUtc)) return null;
+        DateTime? lastUtc = observedUntilUtc?.ToUniversalTime() ?? eventUtc;
+        if (eventUtc.HasValue && (!IsFresh(eventUtc.Value, nowUtc) || lastUtc < eventUtc || !IsFresh(lastUtc!.Value, nowUtc))) return null;
+        if (!eventUtc.HasValue && observedUntilUtc.HasValue) return null;
         Entry? result = null;
         foreach (var entry in Volatile.Read(ref _entries))
         {
@@ -70,7 +76,10 @@ internal sealed class ProxyHintCache
             if (!IsFresh(candidate.Hint.ObservedUtc, nowUtc)) continue;
             if (eventUtc.HasValue)
             {
-                if (!HasLifetime(candidate) || eventUtc < entry.ValidFromUtc ||
+                // Consider every lifetime overlapping the entire byte interval.
+                // A partially overlapping version must not silently disappear
+                // just because another candidate covers both endpoints.
+                if (!HasLifetime(candidate) || lastUtc < entry.ValidFromUtc ||
                     (entry.MissingUtc.HasValue && eventUtc >= entry.MissingUtc)) continue;
             }
             else if (entry.MissingUtc.HasValue) continue;
@@ -86,6 +95,8 @@ internal sealed class ProxyHintCache
                 if (!IsFakeAddress(remote) && (!TryAddress(candidate.Hint.DestinationAddress, out var destination) ||
                     !destination.Equals(remote))) continue;
             }
+            if (eventUtc.HasValue && (eventUtc < entry.ValidFromUtc ||
+                (entry.MissingUtc.HasValue && lastUtc >= entry.MissingUtc))) return null;
             // Lifecycle intervals can overlap between the last live snapshot
             // and the first absent snapshot. Never choose one on that overlap.
             if (result != null && (!SameLifetime(result.Connection, candidate) ||
@@ -97,7 +108,11 @@ internal sealed class ProxyHintCache
 
     public void Clear()
     {
-        lock (_gate) Volatile.Write(ref _entries, Array.Empty<Entry>());
+        lock (_gate)
+        {
+            Volatile.Write(ref _entries, Array.Empty<Entry>());
+            _lastSnapshotUtc = default;
+        }
     }
 
     private static bool IsFresh(DateTime observed, DateTime now) =>

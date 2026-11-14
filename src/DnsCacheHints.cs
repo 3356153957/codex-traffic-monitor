@@ -1,61 +1,86 @@
-using System.Diagnostics;
-using System.IO;
 using System.Net;
-using System.Text.Json;
 
 namespace CodexTraffic;
 
 // Read existing Windows cache only. Never makes a DNS query or sends hostnames elsewhere.
 public sealed class DnsCacheHints : IDisposable
 {
+    internal const int MaximumRecords = 8192;
+    private const int RefreshMilliseconds = 60000;
     private readonly object _gate = new();
     private readonly System.Threading.Timer _timer;
-    private Dictionary<string, string> _hints = new();
+    private readonly Func<IReadOnlyList<DnsCacheRecord>?> _read;
+    private readonly Func<long> _now;
+    private Dictionary<string, DnsHintSet> _hints = new();
     private int _refreshing;
-    private bool _disposed;
+    private volatile bool _disposed;
 
-    public DnsCacheHints() => _timer = new System.Threading.Timer(_ => Refresh(), null, 0, 60000);
+    public DnsCacheHints() : this(WindowsDnsCacheReader.Read, () => Environment.TickCount64, true) { }
+
+    internal DnsCacheHints(Func<IReadOnlyList<DnsCacheRecord>?> read, Func<long> now, bool startTimer = false)
+    {
+        _read = read;
+        _now = now;
+        _timer = new System.Threading.Timer(_ => Refresh(), null,
+            startTimer ? 0 : Timeout.Infinite, startTimer ? RefreshMilliseconds : Timeout.Infinite);
+    }
 
     public string Lookup(string ip)
     {
-        lock (_gate) return _hints.TryGetValue(ip, out var name) ? name : "";
+        lock (_gate)
+        {
+            if (_disposed || !_hints.TryGetValue(ip, out var names)) return "";
+            long now = _now();
+            return now < names.FirstExpiry ? names.Joined :
+                string.Join(" / ", names.Names.Where(x => x.ExpiresAt > now).Select(x => x.Name));
+        }
     }
 
-    private void Refresh()
+    internal void Refresh()
     {
         if (_disposed || Interlocked.Exchange(ref _refreshing, 1) != 0) return;
         try
         {
-            string shell = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell", "v1.0", "powershell.exe");
-            var info = new ProcessStartInfo(shell) { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden, RedirectStandardOutput = true, RedirectStandardError = true };
-            info.ArgumentList.Add("-NoProfile");
-            info.ArgumentList.Add("-NonInteractive");
-            info.ArgumentList.Add("-Command");
-            info.ArgumentList.Add("$ErrorActionPreference='Stop'; Get-DnsClientCache | Where-Object { $_.Type -in 1,28 } | Select-Object Entry,Data,TimeToLive | ConvertTo-Json -Compress");
-            using var process = Process.Start(info);
-            if (process == null) return;
-            var stdout = process.StandardOutput.ReadToEndAsync();
-            var stderr = process.StandardError.ReadToEndAsync();
-            if (!process.WaitForExit(8000)) { process.Kill(true); return; }
-            string raw = stdout.GetAwaiter().GetResult();
-            _ = stderr.GetAwaiter().GetResult();
-            if (process.ExitCode != 0 || string.IsNullOrWhiteSpace(raw)) return;
-            using var json = JsonDocument.Parse(raw);
-            var rows = json.RootElement.ValueKind == JsonValueKind.Array ? json.RootElement.EnumerateArray().ToArray() : new[] { json.RootElement };
-            var hints = new Dictionary<string, List<string>>();
-            foreach (var row in rows)
+            // Measure TTL from before enumeration, never extending a cache record while reading it.
+            long observedAt = _now();
+            var records = _read();
+            var hints = new Dictionary<string, List<DnsHint>>();
+            foreach (var row in records?.Take(MaximumRecords) ?? Enumerable.Empty<DnsCacheRecord>())
             {
-                string? ip = row.GetProperty("Data").GetString(), name = row.GetProperty("Entry").GetString();
-                if (name == null || !IPAddress.TryParse(ip, out var parsed)) continue;
-                string key = parsed.ToString();
+                string name = row.Name.TrimEnd('.');
+                if (row.Type is not (1 or 28) || row.Status != 0 || row.TimeToLive == 0 ||
+                    name.Length is 0 or > 253 || name.Any(c => char.IsControl(c) || char.IsWhiteSpace(c)) ||
+                    !IPAddress.TryParse(row.Address, out var address)) continue;
+                if ((row.Type == 1) != (address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)) continue;
+                string key = address.ToString();
                 if (!hints.TryGetValue(key, out var names)) hints[key] = names = new();
-                if (names.Count < 3 && !names.Contains(name)) names.Add(name);
+                long expiresAt = observedAt + Math.Min(row.TimeToLive * 1000L, RefreshMilliseconds);
+                int duplicate = names.FindIndex(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                if (duplicate >= 0)
+                    names[duplicate] = names[duplicate] with { ExpiresAt = Math.Min(names[duplicate].ExpiresAt, expiresAt) };
+                else if (names.Count < 3) names.Add(new(name, expiresAt));
             }
-            lock (_gate) _hints = hints.ToDictionary(x => x.Key, x => string.Join(" / ", x.Value));
+            lock (_gate)
+                if (!_disposed) _hints = hints.ToDictionary(x => x.Key, x => new DnsHintSet(
+                    x.Value.ToArray(), string.Join(" / ", x.Value.Select(n => n.Name)), x.Value.Min(n => n.ExpiresAt)));
         }
-        catch { /* DNS hints are optional; collection never depends on them. */ }
+        catch
+        {
+            // DNS hints are optional. Failed refreshes must not leave stale names attached forever.
+            lock (_gate) _hints.Clear();
+        }
         finally { Interlocked.Exchange(ref _refreshing, 0); }
     }
 
-    public void Dispose() { _disposed = true; _timer.Dispose(); }
+    public void Dispose()
+    {
+        _disposed = true;
+        _timer.Dispose();
+        lock (_gate) _hints.Clear();
+    }
+
+    private sealed record DnsHint(string Name, long ExpiresAt);
+    private sealed record DnsHintSet(DnsHint[] Names, string Joined, long FirstExpiry);
 }
+
+internal sealed record DnsCacheRecord(string Name, string Address, uint TimeToLive, ushort Type, uint Status);

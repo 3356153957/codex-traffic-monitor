@@ -15,3 +15,5 @@
 全部会话、fixture、日志及报告放到唯一的 `tests/runs/<时间与随机值>/` 下，不写正常 LocalAppData 历史，也不修改代理、TUN、防火墙或进程排除逻辑。权限错误（例如 Windows 10013）、连接失败和接收超时均须保留在失败报告中；仅完成 socket 收发检查不能证明 ETW 方向和字节计量正确，真实结果以完整采集后产生的 `network-check.json` 为准。
 
 可显式传 `-IPv4Only` 单独验证 IPv4 的真实计量。默认双栈测试不会自动忽略 IPv6 权限错误或超时；操作系统明确禁用 IPv6 时才记录跳过。IPv4 专项报告写出 `IPv4Only=true`，不能作为 IPv6 已验证的依据。`client-progress.json` 每组更新，任何后续组失败时，`client-result.json` 都会保留已经完成的组和当前失败组名。
+
+`-Application Claude` 在本次独立测试目录中创建符合 Claude npm 布局的诊断 apphost，不安装或修改真实 Claude。报告同时核对每条测试记录的应用归属。`-StartClientAfterCapture` 要求配合 `-StartCapture`，让客户端在内核采集启动后才创建，覆盖启动事件与快速退出进程的归属；默认方式覆盖采集开始前已经存在的进程。

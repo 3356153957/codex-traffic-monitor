@@ -16,6 +16,14 @@ public static class Program
         try
         {
             if (args.Contains("--self-test")) return SelfTests.Run(ValueAfter(args, "--self-test"));
+            if (args.Contains("--resource-probe"))
+            {
+                int pid = int.TryParse(ValueAfter(args, "--pid"), out var targetPid) ? targetPid : Environment.ProcessId;
+                int seconds = int.TryParse(ValueAfter(args, "--seconds"), out var sampleSeconds) ? Math.Clamp(sampleSeconds, 1, 120) : 10;
+                var report = ResourceDiagnostics.MeasureAsync(pid, TimeSpan.FromSeconds(seconds)).GetAwaiter().GetResult();
+                WriteJson(ValueAfter(args, "--resource-probe") ?? "resources.json", report);
+                return 0;
+            }
             if (args.Contains("--check-updates"))
             {
                 var result = UpdateChecker.CheckAsync().GetAwaiter().GetResult();
@@ -104,7 +112,7 @@ public static class Program
             string directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexTrafficMonitor");
             Directory.CreateDirectory(directory);
             File.AppendAllText(Path.Combine(directory, "errors.log"), DateTime.Now.ToString("O") + " " + e + Environment.NewLine);
-            if (!args.Any(x => x.StartsWith("--self-test") || x.StartsWith("--capture-probe") || x.StartsWith("--snapshot") || x.StartsWith("--configure-startup") || x.StartsWith("--startup-status") || x.StartsWith("--dashboard-snapshot") || x.StartsWith("--maintenance") || x.StartsWith("--check-updates")))
+            if (!args.Any(x => x.StartsWith("--self-test") || x.StartsWith("--capture-probe") || x.StartsWith("--snapshot") || x.StartsWith("--configure-startup") || x.StartsWith("--startup-status") || x.StartsWith("--dashboard-snapshot") || x.StartsWith("--maintenance") || x.StartsWith("--check-updates") || x.StartsWith("--resource-probe")))
                 MessageBox.Show(e.Message, "Codex 流量观察", MessageBoxButton.OK, MessageBoxImage.Error);
             return 1;
         }

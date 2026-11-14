@@ -8,12 +8,15 @@ param(
     [switch]$FixtureOnly,
     [switch]$PrepareOnly,
     [switch]$StartCapture,
-    [switch]$IPv4Only
+    [switch]$IPv4Only,
+    [ValidateSet('Codex','Claude')][string]$Application = 'Codex',
+    [switch]$StartClientAfterCapture
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $projectRoot = Split-Path -Parent $PSScriptRoot
+if ($StartClientAfterCapture -and (!$StartCapture -or $FixtureOnly)) { throw '-StartClientAfterCapture requires -StartCapture and a real ETW test.' }
 if (-not $RunDirectory) { $RunDirectory = Join-Path $PSScriptRoot ('runs\' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [Guid]::NewGuid().ToString('N').Substring(0, 8)) }
 $RunDirectory = [IO.Path]::GetFullPath($RunDirectory)
 if ((Test-Path -LiteralPath $RunDirectory) -and -not (Test-Path -LiteralPath (Join-Path $RunDirectory 'prepared.json'))) { throw "Use a new run directory: $RunDirectory" }
@@ -46,6 +49,7 @@ function Check-Process($Process, [string]$Role) {
 $server = $null
 $client = $null
 $captureProcess = $null
+$clientReady = $null
 try {
     # A deliberately named codex.exe would also be seen by another active monitor.
     # Refuse to touch an existing monitor; do not stop somebody else's recording.
@@ -59,12 +63,18 @@ try {
         throw '-StartCapture requires this entire script to run from administrator PowerShell. The script never requests UAC itself. Elevating only the monitor may leave fixture sockets restricted.'
     }
     $fixtureOutput = Join-Path $RunDirectory 'fixture'
+    if ($Application -eq 'Claude') { $fixtureOutput = Join-Path $fixtureOutput 'node_modules\@anthropic-ai\claude-code-win32-x64' }
     & $DotNetPath build (Join-Path $PSScriptRoot 'network-fixture\NetworkFixture.csproj') -c Release --nologo --output $fixtureOutput
     if ($LASTEXITCODE -ne 0) { throw 'Network fixture build failed.' }
     $dll = Join-Path $fixtureOutput 'codex.dll'
     $exe = Join-Path $fixtureOutput 'codex.exe'
+    if ($Application -eq 'Claude') {
+        $claudeExe = Join-Path $fixtureOutput 'claude.exe'
+        Copy-Item -LiteralPath $exe -Destination $claudeExe
+        $exe = $claudeExe
+    }
     if ($PrepareOnly) {
-        $prepared = [ordered]@{ RunDirectory = $RunDirectory; FixtureExe = $exe; DotNetPath = $DotNetPath; MonitorPath = $MonitorPath; ProbeSeconds = $ProbeSeconds; IPv4Only = [bool]$IPv4Only; Note = 'Build only. No fixture was started and no UAC or ETW capture was attempted. Reuse this directory without -PrepareOnly to run.' }
+        $prepared = [ordered]@{ RunDirectory = $RunDirectory; FixtureExe = $exe; DotNetPath = $DotNetPath; MonitorPath = $MonitorPath; ProbeSeconds = $ProbeSeconds; IPv4Only = [bool]$IPv4Only; Application = $Application; Note = 'Build only. No fixture was started and no UAC or ETW capture was attempted. Reuse this directory without -PrepareOnly to run.' }
         Save-Json $prepared (Join-Path $RunDirectory 'prepared.json')
         Write-Output ($prepared | ConvertTo-Json -Depth 4)
         return
@@ -73,28 +83,34 @@ try {
     if ($IPv4Only) { $serverArguments += '--ipv4-only' }
     $server = Start-Process -FilePath $DotNetPath -ArgumentList $serverArguments -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $RunDirectory 'server-stdout.log') -RedirectStandardError (Join-Path $RunDirectory 'server-stderr.log')
     Wait-File (Join-Path $RunDirectory 'server-ready.json')
+    function Start-FixtureClient {
     if ($FixtureOnly) {
         # No misleading process name is needed for the unprivileged socket check.
         $clientArguments = @((Quote-Argument $dll), '--client', (Quote-Argument $RunDirectory))
         if ($IPv4Only) { $clientArguments += '--ipv4-only' }
-        $client = Start-Process -FilePath $DotNetPath -ArgumentList $clientArguments -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $RunDirectory 'client-stdout.log') -RedirectStandardError (Join-Path $RunDirectory 'client-stderr.log')
+        return Start-Process -FilePath $DotNetPath -ArgumentList $clientArguments -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $RunDirectory 'client-stdout.log') -RedirectStandardError (Join-Path $RunDirectory 'client-stderr.log')
     } else {
         if (-not (Test-Path -LiteralPath $MonitorPath)) { throw "Monitor executable not found: $MonitorPath" }
         $clientArguments = @('--client', (Quote-Argument $RunDirectory))
         if ($IPv4Only) { $clientArguments += '--ipv4-only' }
-        $client = Start-Process -FilePath $exe -ArgumentList $clientArguments -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $RunDirectory 'client-stdout.log') -RedirectStandardError (Join-Path $RunDirectory 'client-stderr.log')
+        return Start-Process -FilePath $exe -ArgumentList $clientArguments -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $RunDirectory 'client-stdout.log') -RedirectStandardError (Join-Path $RunDirectory 'client-stderr.log')
     }
-    Wait-File (Join-Path $RunDirectory 'client-ready.json')
-    $clientReady = Get-Content -LiteralPath (Join-Path $RunDirectory 'client-ready.json') -Raw | ConvertFrom-Json
+    }
+    if (!$StartClientAfterCapture) {
+        $client = Start-FixtureClient
+        Wait-File (Join-Path $RunDirectory 'client-ready.json')
+        $clientReady = Get-Content -LiteralPath (Join-Path $RunDirectory 'client-ready.json') -Raw | ConvertFrom-Json
+    }
     $captureOutput = Join-Path $RunDirectory 'capture.json'
     $probeData = Join-Path $RunDirectory 'probe-data'
     $captureArguments = '--capture-probe ' + (Quote-Argument $captureOutput) + ' --seconds ' + $ProbeSeconds
     $plan = [ordered]@{
-        RunDirectory = $RunDirectory; ClientPid = $clientReady.pid; ClientStartedUtc = $clientReady.startedUtc
+        RunDirectory = $RunDirectory; ClientPid = if ($clientReady) { $clientReady.pid } else { $null }; ClientStartedUtc = if ($clientReady) { $clientReady.startedUtc } else { $null }
         MonitorPath = $MonitorPath; CaptureArguments = $captureArguments; CaptureOutput = $captureOutput
         FixtureOnly = [bool]$FixtureOnly
         StartCapture = [bool]$StartCapture
         IPv4Only = [bool]$IPv4Only
+        Application = $Application; StartClientAfterCapture = [bool]$StartClientAfterCapture
         Note = 'With -StartCapture the already elevated script starts the monitor without another UAC. Otherwise separately start the monitor using the recorded arguments. This script never requests elevation.'
     }
     Save-Json $plan (Join-Path $RunDirectory 'diagnostic-plan.json')
@@ -108,7 +124,7 @@ try {
         $deadline = [DateTime]::UtcNow.AddSeconds($CaptureWaitSeconds)
         $sessionFile = $null
         while (-not $sessionFile) {
-            Check-Process $client 'Client'
+            if ($client) { Check-Process $client 'Client' }
             Check-Process $server 'Server'
             if (Test-Path -LiteralPath $captureOutput) { throw 'Capture ended before the fixture could start; inspect capture.json.' }
             if ([DateTime]::UtcNow -ge $deadline) { throw 'Timed out waiting for the separately elevated capture. No test traffic was sent.' }
@@ -120,6 +136,13 @@ try {
         }
         # Session metadata is created just before EnableKernelProvider; allow it to settle.
         Start-Sleep -Seconds 2
+    }
+    if ($StartClientAfterCapture) {
+        $client = Start-FixtureClient
+        Wait-File (Join-Path $RunDirectory 'client-ready.json')
+        $clientReady = Get-Content -LiteralPath (Join-Path $RunDirectory 'client-ready.json') -Raw | ConvertFrom-Json
+        $plan.ClientPid = $clientReady.pid; $plan.ClientStartedUtc = $clientReady.startedUtc
+        Save-Json $plan (Join-Path $RunDirectory 'diagnostic-plan.json')
     }
     New-Item -ItemType File -Path (Join-Path $RunDirectory 'start-traffic') | Out-Null
     Wait-File (Join-Path $RunDirectory 'client-result.json') 90
@@ -148,12 +171,15 @@ try {
             $actualUp = [long]0
             $actualDown = [long]0
             foreach ($row in $matching) { $actualUp += $row.UploadBytes; $actualDown += $row.DownloadBytes }
+            $expectedApplication = if ($Application -eq 'Claude') { 1 } else { 0 }
+            $wrongOwners = @($matching | Where-Object { [int]$_.Application -ne $expectedApplication })
             $checks += [pscustomobject]@{
                 Channel = $channel.Name; RemoteAddress = $channel.Address; RemotePort = $channel.RemotePort; LocalPort = $channel.LocalPort
                 ExpectedUploadBytes = $channel.UploadBytes; ActualUploadBytes = $actualUp
                 ExpectedDownloadBytes = $channel.DownloadBytes; ActualDownloadBytes = $actualDown
                 DirectionReversed = ($actualUp -eq $channel.DownloadBytes -and $actualDown -eq $channel.UploadBytes)
-                Passed = ($actualUp -eq $channel.UploadBytes -and $actualDown -eq $channel.DownloadBytes)
+                ExpectedApplication = $Application; WrongApplicationRows = $wrongOwners.Count
+                Passed = ($actualUp -eq $channel.UploadBytes -and $actualDown -eq $channel.DownloadBytes -and $wrongOwners.Count -eq 0)
             }
         }
         $unmatched = @($flows | Where-Object {
@@ -164,6 +190,7 @@ try {
             success = (@($checks | Where-Object { -not $_.Passed }).Count -eq 0 -and $unmatched.Count -eq 0 -and $capture.snapshot.EventsLost -eq 0)
             scope = 'Real production ETW capture; isolated data directory; results filtered to the fixture PID.'
             IPv4Only = [bool]$IPv4Only
+            Application = $Application; StartClientAfterCapture = [bool]$StartClientAfterCapture
             clientPid = $clientReady.pid; checks = $checks; unmatchedClientFlows = $unmatched
             eventsLost = $capture.snapshot.EventsLost; clientFlows = $flows; flowFile = $flowFile; runDirectory = $RunDirectory
         }

@@ -1,5 +1,8 @@
+using System.Buffers;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text.Json;
+using Microsoft.Win32.SafeHandles;
 
 namespace CodexTraffic;
 
@@ -31,6 +34,9 @@ public sealed class HistoryAnalytics
         _directory = Path.Combine(dataDirectory, "sessions");
         _utcNow = utcNow ?? (() => DateTime.UtcNow);
     }
+
+    // Opaque identity replaced when data, warnings or the local day change.
+    internal object PublishedVersion => Volatile.Read(ref _published);
 
     public void Refresh()
     {
@@ -70,9 +76,21 @@ public sealed class HistoryAnalytics
                 if (changed || previousWarning != _directoryWarning)
                 {
                     _needsPublish = true;
-                    var snapshots = Enum.GetValues<DashboardRange>()
-                        .SelectMany(range => Enum.GetValues<DashboardTrafficScope>().Select(scope => (range, scope)))
-                        .ToDictionary(key => key, key => BuildSnapshot(key.range, key.scope, now));
+                    var snapshots = new Dictionary<(DashboardRange, DashboardTrafficScope), PublishedSnapshot>();
+                    var targetPool = new PublishedTargetPool();
+                    var targetRanges = new List<(DayIndex[] Days, List<TargetRow> Targets)>();
+                    foreach (var range in Enum.GetValues<DashboardRange>())
+                    {
+                        // Different date selectors often include exactly the same
+                        // recorded days. Reuse their immutable target list within
+                        // this publication instead of merging/sorting it again.
+                        var selectedDays = SelectedDays(range, today);
+                        var sharedTargets = targetRanges.FirstOrDefault(item => item.Days.SequenceEqual(selectedDays)).Targets;
+                        var all = BuildSnapshot(range, DashboardTrafficScope.All, now, targetPool, sharedTargets);
+                        if (sharedTargets == null) targetRanges.Add((selectedDays, all.Total.Targets));
+                        snapshots[(range, DashboardTrafficScope.All)] = all;
+                        snapshots[(range, DashboardTrafficScope.Proxy)] = BuildSnapshot(range, DashboardTrafficScope.Proxy, now, targetPool, all.Total.Targets);
+                    }
                     Volatile.Write(ref _published, snapshots);
                     _publishedDay = today;
                     _needsPublish = false;
@@ -80,6 +98,21 @@ public sealed class HistoryAnalytics
             }
         }
     }
+
+    private DayIndex[] SelectedDays(DashboardRange range, DateTime today)
+    {
+        DateTime? start = RangeStart(range, today);
+        return _sessions.Values.SelectMany(index => index.Days)
+            .Where(day => InRange(day.Key, start, today)).Select(day => day.Value).ToArray();
+    }
+
+    private static DateTime? RangeStart(DashboardRange range, DateTime today) => range switch
+    {
+        DashboardRange.Today => today,
+        DashboardRange.Last7Days => today.AddDays(-6),
+        DashboardRange.Last30Days => today.AddDays(-29),
+        _ => null
+    };
 
     public DashboardSnapshot GetSnapshot(DashboardRange range, DashboardTrafficScope scope = DashboardTrafficScope.All,
         DashboardApplicationScope applicationScope = DashboardApplicationScope.Total)
@@ -93,11 +126,14 @@ public sealed class HistoryAnalytics
             DashboardApplicationScope.Claude => entry.Claude,
             _ => entry.Total
         };
-        // Application slices retain only scalar/daily summaries. The eight total
-        // snapshots own the aggregate target rows; no threefold target cache is
-        // retained, and UI queries never take the file-indexing lock.
-        var targets = entry.Total.Targets.Where(t => applicationScope == DashboardApplicationScope.Total ||
-            t.Application == (applicationScope == DashboardApplicationScope.Claude ? TrackedApplication.Claude : TrackedApplication.Codex));
+        // Proxy/application slices filter the same immutable aggregate targets.
+        // Equivalent range aggregates also share rows with the daily index;
+        // appending to a published daily row uses copy-on-write. UI queries
+        // neither aggregate history nor take the file-indexing lock.
+        var targets = entry.Total.Targets.Where(t =>
+            (saved.TrafficScope != DashboardTrafficScope.Proxy || t.TrafficKind == TrafficKind.Proxy) &&
+            (applicationScope == DashboardApplicationScope.Total ||
+                t.Application == (applicationScope == DashboardApplicationScope.Claude ? TrackedApplication.Claude : TrackedApplication.Codex)));
         // Protect the index and other windows from callers modifying data-bound rows.
         return new DashboardSnapshot
         {
@@ -118,18 +154,13 @@ public sealed class HistoryAnalytics
         };
     }
 
-    private PublishedSnapshot BuildSnapshot(DashboardRange range, DashboardTrafficScope scope, DateTime now)
+    private PublishedSnapshot BuildSnapshot(DashboardRange range, DashboardTrafficScope scope, DateTime now,
+        PublishedTargetPool targetPool, List<TargetRow>? sharedTargets = null)
     {
         lock (_gate)
         {
             DateTime today = now.ToLocalTime().Date;
-            DateTime? start = range switch
-            {
-                DashboardRange.Today => today,
-                DashboardRange.Last7Days => today.AddDays(-6),
-                DashboardRange.Last30Days => today.AddDays(-29),
-                _ => null
-            };
+            DateTime? start = RangeStart(range, today);
             DashboardSnapshot NewSnapshot(DashboardApplicationScope applicationScope) => new()
             {
                 Range = range, TrafficScope = scope, ApplicationScope = applicationScope, FromUtc = start?.ToUniversalTime(), ToUtc = now,
@@ -138,7 +169,7 @@ public sealed class HistoryAnalytics
             var snapshot = NewSnapshot(DashboardApplicationScope.Total);
             var applications = new[] { NewSnapshot(DashboardApplicationScope.Codex), NewSnapshot(DashboardApplicationScope.Claude) };
             var days = new[] { new SortedDictionary<DateTime, DailyUsageRow>(), new SortedDictionary<DateTime, DailyUsageRow>() };
-            var targets = new Dictionary<TargetKey, TargetRow>();
+            var targets = sharedTargets == null ? new Dictionary<TargetKey, TargetAggregate>() : null;
             int malformedRows = 0, malformedSessions = 0, metadataErrors = 0, flowErrors = 0;
             int inconsistentSessions = 0, unallocatedSessions = 0, partialTails = 0, lostSessions = 0;
             foreach (var index in _sessions.Values)
@@ -211,12 +242,12 @@ public sealed class HistoryAnalytics
                         if (!days[app].TryGetValue(pair.Key, out var day)) days[app][pair.Key] = day = new DailyUsageRow { Date = pair.Key };
                         day.UploadBytes += dayUp; day.DownloadBytes += dayDown;
                     }
-                    if (!selectedDay) continue;
+                    if (!selectedDay || targets == null) continue;
                     foreach (var target in pair.Value.Targets)
                     {
-                        if (scope == DashboardTrafficScope.Proxy && target.Value.TrafficKind != TrafficKind.Proxy) continue;
-                        if (!targets.TryGetValue(target.Key, out var aggregate)) targets[target.Key] = aggregate = CloneTarget(target.Value);
-                        else MergeTarget(aggregate, target.Value);
+                        if (!targets.TryGetValue(target.Key, out var aggregate))
+                            targets[target.Key] = new TargetAggregate(target.Value.Share(), shared: true);
+                        else MergeTarget(aggregate.Writable(), target.Value.Value);
                     }
                 }
 
@@ -246,7 +277,8 @@ public sealed class HistoryAnalytics
             snapshot.DailyUsage = applications.SelectMany(a => a.DailyUsage).GroupBy(d => d.Date).OrderBy(g => g.Key)
                 .Select(g => new DailyUsageRow { Date = g.Key, UploadBytes = g.Sum(d => d.UploadBytes), DownloadBytes = g.Sum(d => d.DownloadBytes) }).ToList();
             snapshot.RecordedDays = snapshot.DailyUsage.Count;
-            snapshot.Targets = targets.Values.OrderByDescending(t => (decimal)t.UploadBytes + t.DownloadBytes).ToList();
+            snapshot.Targets = sharedTargets ?? targets!.OrderByDescending(t => (decimal)t.Value.Value.UploadBytes + t.Value.Value.DownloadBytes)
+                .Select(t => targetPool.Share(t.Key, t.Value.Share())).ToList();
             var warnings = new List<string>();
             if (_directoryWarning.Length > 0) warnings.Add(_directoryWarning);
             if (metadataErrors > 0) warnings.Add($"{metadataErrors} 个会话的摘要无法读取，相关统计使用可读明细或上次可用摘要。");
@@ -316,45 +348,22 @@ public sealed class HistoryAnalytics
             if (index.SeenLength == info.Length && index.FlowWriteUtc == info.LastWriteTimeUtc && index.LastReadClosed == closed && index.FlowError.Length == 0) return;
             // Replacement/truncation must rebuild this session, not preserve stale
             // bytes and add a second copy of its rewritten rows.
-            if (info.Length < index.SeenLength || info.Length == index.SeenLength && info.LastWriteTimeUtc != index.FlowWriteUtc) index.ResetFlows();
-            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 65536, FileOptions.SequentialScan);
+            // A closed log is immutable during normal recording. Any later
+            // change may be a repaired/replaced file, including a longer one.
+            if (index.LastReadClosed || info.Length < index.SeenLength ||
+                info.Length == index.SeenLength && info.LastWriteTimeUtc != index.FlowWriteUtc) index.ResetFlows();
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 1, FileOptions.SequentialScan);
+            var identity = FlowFileIdentity.Read(stream.SafeFileHandle);
+            // Length alone cannot distinguish an append from an atomic file
+            // replacement. Only changed files reach this handle query; idle
+            // polling retains its metadata-only fast path.
+            if (index.FileIdentity.HasValue && index.FileIdentity.Value != identity) index.ResetFlows();
             long length = stream.Length;
             if (length < index.Offset) index.ResetFlows();
             stream.Position = index.Offset;
-            byte[] buffer = new byte[65536];
-            using var line = new MemoryStream();
-            bool tooLong = false;
-            long cursor = index.Offset;
-            while (cursor < length)
-            {
-                int read = stream.Read(buffer, 0, (int)Math.Min(buffer.Length, length - cursor));
-                if (read == 0) break;
-                for (int i = 0; i < read; i++)
-                {
-                    cursor++;
-                    if (buffer[i] == (byte)'\n')
-                    {
-                        if (tooLong) index.BadLines++;
-                        else ReadLine(index, line.GetBuffer().AsSpan(0, (int)line.Length));
-                        index.Offset = cursor;
-                        line.SetLength(0); tooLong = false;
-                    }
-                    else if (!tooLong)
-                    {
-                        if (line.Length >= MaximumLineBytes) { line.SetLength(0); tooLong = true; }
-                        else line.WriteByte(buffer[i]);
-                    }
-                }
-            }
-            index.IncompleteClosedTail = false;
-            if (closed && cursor > index.Offset)
-            {
-                // A final valid JSON object need not have a line terminator. An
-                // incomplete UTF-8/JSON tail stays uncommitted and can be retried.
-                if (!tooLong && ReadLine(index, line.GetBuffer().AsSpan(0, (int)line.Length), countFailure: false)) index.Offset = cursor;
-                else index.IncompleteClosedTail = true;
-            }
+            ReadFlowLines(index, stream, length, closed);
             index.SeenLength = length; index.FlowWriteUtc = info.LastWriteTimeUtc;
+            index.FileIdentity = identity;
             index.LastReadClosed = closed; index.FlowError = "";
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
@@ -363,10 +372,74 @@ public sealed class HistoryAnalytics
         }
     }
 
+    private static void ReadFlowLines(SessionIndex index, Stream stream, long length, bool closed)
+    {
+        const int blockSize = 65536;
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(blockSize);
+        MemoryStream? line = null;
+        bool tooLong = false;
+        long cursor = index.Offset;
+        try
+        {
+            while (cursor < length)
+            {
+                int read = stream.Read(buffer, 0, (int)Math.Min(blockSize, length - cursor));
+                if (read == 0) break;
+                int offset = 0;
+                while (offset < read)
+                {
+                    var remaining = buffer.AsSpan(offset, read - offset);
+                    int newline = remaining.IndexOf((byte)'\n');
+                    bool terminated = newline >= 0;
+                    var fragment = terminated ? remaining[..newline] : remaining;
+                    int consumed = fragment.Length + (terminated ? 1 : 0);
+                    cursor += consumed;
+                    offset += consumed;
+                    if (!tooLong)
+                    {
+                        if ((line?.Length ?? 0) + fragment.Length > MaximumLineBytes)
+                        { line?.SetLength(0); tooLong = true; }
+                        else if (terminated && (line == null || line.Length == 0))
+                            ReadLine(index, fragment);
+                        else
+                        {
+                            // Only a line crossing a block boundary or a final
+                            // unterminated tail needs a separate contiguous copy.
+                            line ??= new MemoryStream();
+                            line.Write(fragment);
+                            if (terminated) ReadLine(index, line.GetBuffer().AsSpan(0, (int)line.Length));
+                        }
+                    }
+                    if (terminated)
+                    {
+                        if (tooLong) index.BadLines++;
+                        index.Offset = cursor;
+                        line?.SetLength(0);
+                        tooLong = false;
+                    }
+                }
+            }
+            index.IncompleteClosedTail = false;
+            if (closed && cursor > index.Offset)
+            {
+                // Keep an open or invalid final row uncommitted so a later
+                // refresh can reread it exactly once from the last newline.
+                var tail = line == null ? ReadOnlySpan<byte>.Empty : line.GetBuffer().AsSpan(0, (int)line.Length);
+                if (!tooLong && ReadLine(index, tail, countFailure: false)) index.Offset = cursor;
+                else index.IncompleteClosedTail = true;
+            }
+        }
+        finally
+        {
+            line?.Dispose();
+            ArrayPool<byte>.Shared.Return(buffer, clearArray: true);
+        }
+    }
+
     private static bool ReadLine(SessionIndex index, ReadOnlySpan<byte> bytes, bool countFailure = true)
     {
         if (bytes.Length > 0 && bytes[^1] == (byte)'\r') bytes = bytes[..^1];
-        if (index.Offset == 0 && bytes.StartsWith(new byte[] { 0xef, 0xbb, 0xbf })) bytes = bytes[3..];
+        if (index.Offset == 0 && bytes.StartsWith("\uFEFF"u8)) bytes = bytes[3..];
         if (bytes.IsEmpty) return true;
         try
         {
@@ -386,11 +459,11 @@ public sealed class HistoryAnalytics
             // overflow row must not leave behind a partially added daily total.
             _ = checked(app.Upload + flow.UploadBytes); _ = checked(app.Download + flow.DownloadBytes);
             _ = checked(dayApp.Upload + flow.UploadBytes); _ = checked(dayApp.Download + flow.DownloadBytes);
-            if (!day.Targets.TryGetValue(key, out var aggregate)) day.Targets[key] = target;
+            if (!day.Targets.TryGetValue(key, out var aggregate)) day.Targets[key] = new TargetAggregate(target);
             else
             {
-                _ = checked(aggregate.UploadBytes + target.UploadBytes); _ = checked(aggregate.DownloadBytes + target.DownloadBytes);
-                MergeTarget(aggregate, target);
+                _ = checked(aggregate.Value.UploadBytes + target.UploadBytes); _ = checked(aggregate.Value.DownloadBytes + target.DownloadBytes);
+                MergeTarget(aggregate.Writable(), target);
             }
             app.Upload += flow.UploadBytes; app.Download += flow.DownloadBytes; app.ValidLines++;
             if (app.FirstTimestampUtc == null || utc < app.FirstTimestampUtc) app.FirstTimestampUtc = utc;
@@ -461,7 +534,66 @@ public sealed class HistoryAnalytics
     }
 
     private sealed record PublishedSnapshot(DashboardSnapshot Total, DashboardSnapshot Codex, DashboardSnapshot Claude);
+    // TargetRow remains mutable for data binding at the public boundary. Inside
+    // the history index a shared row is never changed again: its next writer
+    // first replaces its private reference, preserving lock-free publications.
+    private sealed class TargetAggregate
+    {
+        private TargetRow _value;
+        private bool _shared;
+        public TargetRow Value => _value;
+        public TargetAggregate(TargetRow value, bool shared = false) { _value = value; _shared = shared; }
+        public TargetRow Share() { _shared = true; return _value; }
+        public TargetRow Writable()
+        {
+            if (_shared) { _value = CloneTarget(_value); _shared = false; }
+            return _value;
+        }
+    }
+    // This pool lasts only for one publication. Most targets belong to one day
+    // and have identical values in several calendar ranges. Retain a single row
+    // for them instead of one row per range/proxy combination.
+    private sealed class PublishedTargetPool
+    {
+        private readonly Dictionary<TargetKey, List<TargetRow>> _rows = new();
+        public TargetRow Share(TargetKey key, TargetRow row)
+        {
+            if (!_rows.TryGetValue(key, out var candidates)) _rows[key] = candidates = new List<TargetRow>(1);
+            foreach (var candidate in candidates)
+                if (ReferenceEquals(candidate, row) || SameTarget(candidate, row)) return candidate;
+            candidates.Add(row);
+            return row;
+        }
+        private static bool SameTarget(TargetRow left, TargetRow right) =>
+            left.Application == right.Application && left.Address == right.Address && left.Port == right.Port && left.Target == right.Target &&
+            left.Process == right.Process && left.Protocol == right.Protocol && left.Route == right.Route && left.Hostname == right.Hostname &&
+            left.DomainSource == right.DomainSource && left.ProxyDestination == right.ProxyDestination && left.ProxyChain == right.ProxyChain &&
+            left.ProxyNode == right.ProxyNode && left.Region == right.Region && left.RegionSource == right.RegionSource && left.ProxyType == right.ProxyType &&
+            left.TrafficKind == right.TrafficKind && left.TrafficKindSource == right.TrafficKindSource && left.UploadBytes == right.UploadBytes &&
+            left.DownloadBytes == right.DownloadBytes && left.LastSeen == right.LastSeen;
+    }
     private readonly record struct TargetKey(TrackedApplication Application, string Process, string Protocol, string Address, int Port, string Hostname, string ProxyDestination, string ProxyNode, TrafficKind TrafficKind, string ProxyType);
+    private readonly record struct FlowFileIdentity(uint Volume, uint IndexHigh, uint IndexLow)
+    {
+        public static FlowFileIdentity Read(SafeFileHandle handle)
+        {
+            if (!GetFileInformationByHandle(handle, out var information))
+                throw new IOException("无法读取流量文件标识。", new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()));
+            return new(information.VolumeSerialNumber, information.FileIndexHigh, information.FileIndexLow);
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out FileInformation information);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileInformation
+        {
+            public uint FileAttributes;
+            public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime, LastAccessTime, LastWriteTime;
+            public uint VolumeSerialNumber, FileSizeHigh, FileSizeLow, NumberOfLinks, FileIndexHigh, FileIndexLow;
+        }
+    }
     private readonly record struct SummaryStamp(long Upload, long Download, int AccountingVersion, long CodexUpload, long CodexDownload,
         long ClaudeUpload, long ClaudeDownload, long Lost, DateTime Started, DateTime? Ended, DateTime UpdatedDay, string Status);
     private sealed class ApplicationIndex
@@ -478,7 +610,7 @@ public sealed class HistoryAnalytics
     private sealed class DayIndex
     {
         public readonly DayApplicationIndex[] Applications = { new(), new() };
-        public readonly Dictionary<TargetKey, TargetRow> Targets = new();
+        public readonly Dictionary<TargetKey, TargetAggregate> Targets = new();
     }
     private sealed class SessionIndex
     {
@@ -486,6 +618,7 @@ public sealed class HistoryAnalytics
         public SessionRecord? Record;
         public long MetadataLength = -1, SeenLength = -1, Offset, Upload, Download;
         public DateTime MetadataWriteUtc, FlowWriteUtc;
+        public FlowFileIdentity? FileIdentity;
         public DateTime? FirstTimestampUtc;
         public int BadLines, ValidLines;
         public bool LastReadClosed, IncompleteClosedTail;
@@ -503,6 +636,7 @@ public sealed class HistoryAnalytics
         public void ResetFlows()
         {
             SeenLength = -1; Offset = Upload = Download = 0; BadLines = ValidLines = 0;
+            FileIdentity = null;
             FirstTimestampUtc = null; LastReadClosed = IncompleteClosedTail = false; Days.Clear();
             for (int app = 0; app < Applications.Length; app++) Applications[app] = new ApplicationIndex();
         }

@@ -32,13 +32,15 @@ public sealed class ProcessCatalog
     private readonly object _gate = new();
     private readonly object _refreshGate = new();
     private Dictionary<int, Entry> _processes = new();
-    private readonly Dictionary<int, long> _stoppedVersions = new();
+    private readonly Dictionary<int, StopStamp> _stoppedVersions = new();
+    private readonly Queue<(int Pid, StopStamp Stop)> _stopOrder = new();
     private readonly Dictionary<int, List<RetiredEntry>> _recentlyExited = new();
     private readonly Queue<RetiredEntry> _retirementOrder = new();
     private readonly int _ownPid = Environment.ProcessId;
     private long _version;
     private const int MaxRetiredIdentities = 4096;
     private static readonly TimeSpan RetiredRetention = TimeSpan.FromSeconds(15);
+    private readonly record struct StopStamp(long Version, DateTime StoppedAt, DateTime ObservedAt);
 
     private sealed class Entry
     {
@@ -78,7 +80,7 @@ public sealed class ProcessCatalog
                         next[info.Pid] = previous;
                         continue;
                     }
-                    if (_stoppedVersions.TryGetValue(info.Pid, out var stopVersion) && stopVersion > before)
+                    if (_stoppedVersions.TryGetValue(info.Pid, out var stop) && stop.Version > before)
                         continue;
                     if (previous is not null && !SameIdentity(previous.Info, info))
                         RetireLocked(previous, info.StartedAt == DateTime.MinValue ? snapshotAt : info.StartedAt);
@@ -97,8 +99,6 @@ public sealed class ProcessCatalog
                 _processes = next;
                 ClassifyLocked();
                 PruneRetiredLocked();
-                foreach (var pid in _stoppedVersions.Where(p => p.Value <= before).Select(p => p.Key).ToArray())
-                    _stoppedVersions.Remove(pid);
             }
         }
     }
@@ -170,6 +170,18 @@ public sealed class ProcessCatalog
         var processName = FileName(name);
         if (string.IsNullOrWhiteSpace(processName) && path.Length != 0) processName = FileName(path);
         if (path.Length == 0 && IsAbsoluteWindowsPath(name)) path = name;
+        // Fast processes may exit before ETW dispatch, so the native image query
+        // can fail. Only the absolute executable token, matching ETW's image
+        // filename, is eligible as a fallback; later arguments are never paths
+        // or ownership evidence. CoreIdentity still validates trusted installs.
+        if (path.Length == 0 && !string.IsNullOrWhiteSpace(commandLine) && commandLine.Length <= 65536)
+        {
+            int cursor = 0;
+            if (TryReadWindowsArgument(commandLine, ref cursor, out var executable) &&
+                NormalizeImagePath(executable) is { Length: > 0 } normalized &&
+                FileName(normalized).Equals(processName, StringComparison.OrdinalIgnoreCase))
+                path = normalized;
+        }
         var startedAt = queried.Start != DateTime.MinValue ? queried.Start : eventStart;
         var info = new ProcessInfo(pid, parentId, processName, path, "tool", startedAt);
 
@@ -179,6 +191,23 @@ public sealed class ProcessCatalog
             // Start/rundown events can arrive out of order; never replace a newer identity.
             if (previous is not null && previous.Info.StartedAt != DateTime.MinValue &&
                 eventStart != DateTime.MinValue && previous.Info.StartedAt > eventStart.AddMilliseconds(100)) return;
+            if (eventStart != DateTime.MinValue && _stoppedVersions.TryGetValue(pid, out var stopped) && eventStart <= stopped.StoppedAt)
+            {
+                // A stop can be dispatched before its start. Recover only that
+                // bounded historical lifetime; never turn the exited PID live.
+                // Invalidate an overlapping native snapshot as a stop would.
+                var marker = stopped with { Version = ++_version, ObservedAt = DateTime.UtcNow };
+                _stoppedVersions[pid] = marker;
+                _stopOrder.Enqueue((pid, marker));
+                if (info.StartedAt <= stopped.StoppedAt &&
+                    (!_recentlyExited.TryGetValue(pid, out var exited) || !exited.Any(e => SameIdentity(e.Process.Info, info))))
+                {
+                    var retired = CreateEntry(info, null, commandLine);
+                    RetireLocked(retired, stopped.StoppedAt);
+                }
+                ClassifyLocked();
+                return;
+            }
             if (previous is not null && !SameIdentity(previous.Info, info))
                 RetireLocked(previous, startedAt == DateTime.MinValue ? DateTime.UtcNow : startedAt);
             BoundOlderLifetimesLocked(pid, startedAt);
@@ -205,7 +234,12 @@ public sealed class ProcessCatalog
             if (process is not null)
                 RetireLocked(process, stoppedUtc == DateTime.MinValue ? DateTime.UtcNow : stoppedUtc);
             _processes.Remove(pid);
-            _stoppedVersions[pid] = ++_version;
+            DateTime stopTime = stoppedUtc == DateTime.MinValue ? DateTime.UtcNow : stoppedUtc;
+            if (_stoppedVersions.TryGetValue(pid, out var previousStop) && previousStop.StoppedAt > stopTime)
+                stopTime = previousStop.StoppedAt;
+            var marker = new StopStamp(++_version, stopTime, DateTime.UtcNow);
+            _stoppedVersions[pid] = marker;
+            _stopOrder.Enqueue((pid, marker));
             PruneRetiredLocked();
             // Existing children retain their birth-time ownership after the parent exits.
         }
@@ -253,6 +287,13 @@ public sealed class ProcessCatalog
             if (!_recentlyExited.TryGetValue(pid, out var entries)) continue;
             entries.Remove(oldest);
             if (entries.Count == 0) _recentlyExited.Remove(pid);
+        }
+        while (_stopOrder.TryPeek(out var oldestStop) &&
+               (_stopOrder.Count > MaxRetiredIdentities || oldestStop.Stop.ObservedAt < cutoff))
+        {
+            _stopOrder.Dequeue();
+            if (_stoppedVersions.TryGetValue(oldestStop.Pid, out var current) && current.Version == oldestStop.Stop.Version)
+                _stoppedVersions.Remove(oldestStop.Pid);
         }
     }
 
@@ -306,44 +347,54 @@ public sealed class ProcessCatalog
 
     private void ClassifyLocked()
     {
+        PruneRetiredLocked();
         // Parent PIDs alone are insufficient: Windows reuses them after a process exits.
         // A parent created after its alleged child cannot establish an ownership link.
-        for (var pass = 0; pass < _processes.Count; pass++)
+        // Start/stop events from different CPUs can also put a child in the
+        // retired cache before its parent is identified. Reconcile those same
+        // bounded identities so later network callbacks can resolve the child.
+        // Historical repair requires known birth times for both identities.
+        var identityCount = _processes.Count + _retirementOrder.Count;
+        for (var pass = 0; pass < identityCount; pass++)
         {
             var changed = false;
             foreach (var entry in _processes.Values)
-            {
-                if (entry.Info.ParentId == entry.Info.Pid) continue;
-                var parent = ParentAtBirthLocked(entry.Info);
-                if (parent is null) continue;
-                if (parent.Excluded && !entry.Excluded)
-                {
-                    entry.Excluded = true;
-                    changed = true;
-                }
-                if ((parent.Core || parent.Descendant) &&
-                    (!entry.Descendant || (!entry.Core && entry.Info.Application != parent.Info.Application)))
-                {
-                    entry.Descendant = true;
-                    // A nested CLI is a new application root: Claude launched
-                    // by Codex and Codex launched by Claude each own their own
-                    // descendants. Every PID has exactly one application owner.
-                    if (!entry.Core)
-                        entry.Info = entry.Info with
-                        {
-                            Application = parent.Info.Application,
-                            FriendlyKind = DescendantKind(parent.Info.Application)
-                        };
-                    changed = true;
-                }
-            }
+                changed |= ClassifyFromParentLocked(entry);
+            foreach (var retired in _retirementOrder)
+                changed |= ClassifyFromParentLocked(retired.Process, requireKnownBirth: true);
             if (!changed) break;
         }
     }
 
-    private Entry? ParentAtBirthLocked(ProcessInfo child)
+    private bool ClassifyFromParentLocked(Entry entry, bool requireKnownBirth = false)
     {
-        if (_processes.TryGetValue(child.ParentId, out var parent) && CanBeParent(parent.Info, child))
+        if (entry.Info.ParentId == entry.Info.Pid) return false;
+        var parent = ParentAtBirthLocked(entry.Info, requireKnownBirth);
+        if (parent is null) return false;
+        bool changed = false;
+        if (parent.Excluded && !entry.Excluded) { entry.Excluded = true; changed = true; }
+        if ((parent.Core || parent.Descendant) &&
+            (!entry.Descendant || (!entry.Core && entry.Info.Application != parent.Info.Application)))
+        {
+            entry.Descendant = true;
+            // A nested CLI is a new application root: Claude launched by Codex
+            // and Codex launched by Claude each own their own descendants.
+            if (!entry.Core)
+                entry.Info = entry.Info with
+                {
+                    Application = parent.Info.Application,
+                    FriendlyKind = DescendantKind(parent.Info.Application)
+                };
+            changed = true;
+        }
+        return changed;
+    }
+
+    private Entry? ParentAtBirthLocked(ProcessInfo child, bool requireKnownBirth)
+    {
+        if (requireKnownBirth && child.StartedAt == DateTime.MinValue) return null;
+        if (_processes.TryGetValue(child.ParentId, out var parent) &&
+            (!requireKnownBirth || parent.Info.StartedAt != DateTime.MinValue) && CanBeParent(parent.Info, child))
             return parent;
         // A short-lived parent's stop may be delivered before its child's start.
         // Resolve only a bounded lifetime containing the known child birth time;

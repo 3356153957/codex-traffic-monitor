@@ -140,6 +140,8 @@ public sealed class FlowRecord
     // Missing fields in pre-Claude JSONL records deserialize to Codex (zero).
     public TrackedApplication Application { get; set; }
     public DateTime TimestampUtc { get; set; }
+    // Old records omit this field and retain TimestampUtc as their only event time.
+    public DateTime LastTimestampUtc { get; set; }
     public int Pid { get; set; }
     public string Process { get; set; } = "";
     public string ProcessPath { get; set; } = "";

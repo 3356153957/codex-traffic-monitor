@@ -23,8 +23,10 @@ public sealed class GeoIpHints : IDisposable
             try
             {
                 if (!File.Exists(path)) continue;
-                using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-                _reader = new Reader(stream);
+                // File-backed pages can be shared/reclaimed by Windows; the
+                // stream constructor copies the entire database to private pages.
+                // MaxMind opens this mode with FileShare.Read | FileShare.Delete.
+                _reader = new Reader(path, FileAccessMode.MemoryMapped);
                 break;
             }
             catch { /* Optional, missing or incompatible local database. */ }

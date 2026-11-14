@@ -29,6 +29,11 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _timer;
     private MonitorSnapshot? _snapshot;
     private DashboardSnapshot? _dashboard;
+    private object? _dashboardVersion;
+    private List<TargetRow> _sortedTargets = new();
+    private readonly Dictionary<string, double> _suspendedScrollOffsets = new();
+    private readonly ResourceSampler _resourceSampler = new();
+    private bool _exportingDiagnostics;
     private DashboardRange _range = DashboardRange.All;
     private DashboardTrafficScope _trafficScope = DashboardTrafficScope.All;
     private DashboardApplicationScope _applicationScope = DashboardApplicationScope.Total;
@@ -75,6 +80,10 @@ public partial class MainWindow : Window
         _loading = false;
         _timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         _timer.Tick += (_, _) => RefreshSnapshot(true);
+        IsVisibleChanged += (_, _) =>
+        {
+            if (_windowLoaded && !IsVisible && !_demo && string.IsNullOrWhiteSpace(PreviewOutputPath)) ReleaseDashboardView();
+        };
         Loaded += Window_Loaded;
         Closing += Window_Closing;
         SizeChanged += (_, _) => UpdateResponsiveLayout();
@@ -133,7 +142,7 @@ public partial class MainWindow : Window
         if (_disposed) return;
         // Collection and disk flushes run in MonitorEngine independently. A tray
         // window only needs its icon state, not thousands of data-bound rows.
-        if (addSample && !IsVisible && !_demo)
+        if (!IsVisible && !_demo && string.IsNullOrWhiteSpace(PreviewOutputPath))
         {
             _tray?.UpdateMonitoring(_engine.IsRunning);
             return;
@@ -141,9 +150,18 @@ public partial class MainWindow : Window
         try
         {
             _snapshot = _demo ? CreateDemoSnapshot(_applicationScope) : _engine.GetSnapshot(includeTargets: false, applicationScope: _applicationScope);
-            _dashboard = _demo ? CreateDemoDashboard(_range, _trafficScope, _applicationScope) : _engine.GetDashboardSnapshot(_range, _trafficScope, _applicationScope);
+            var version = _engine.DashboardVersion;
+            bool dataChanged = _demo || _dashboard == null || !ReferenceEquals(version, _dashboardVersion) ||
+                _dashboard.Range != _range || _dashboard.TrafficScope != _trafficScope || _dashboard.ApplicationScope != _applicationScope;
+            bool dashboardChanged = !addSample || dataChanged;
+            if (dataChanged)
+            {
+                _dashboard = _demo ? CreateDemoDashboard(_range, _trafficScope, _applicationScope) : _engine.GetDashboardSnapshot(_range, _trafficScope, _applicationScope);
+                _dashboardVersion = version;
+            }
             var current = _snapshot;
-            var summary = _dashboard;
+            var summary = _dashboard!;
+            summary.ToUtc = DateTime.UtcNow;
             UpdateRangeButtons();
             UpdateTrafficScopeButtons();
             UpdateApplicationScopeButtons();
@@ -189,21 +207,21 @@ public partial class MainWindow : Window
             int chartDays = (int)(chartLast - chartFirst).TotalDays + 1;
             DailyRangeText.Text = ApplicationScopeLabel(_applicationScope) + " · " + TrafficScopeLabel(_trafficScope) + " · " + (_range == DashboardRange.Today ? "今日" : "最近 " + chartDays + " 天") + (_range == DashboardRange.All ? "趋势 · 累计包含全部日期" : " · 空白日期表示当天无记录");
             DailyRangeText.ToolTip = "每日上下行按本地日期汇总，只包含实际监控时段。" + (_range == DashboardRange.All ? "图表显示最近日期，顶部累计用量包含全部历史记录。" : "");
-            DailyChart.SetUsage(summary.DailyUsage, chartFirst, chartLast, waiting);
+            if (dashboardChanged) DailyChart.SetUsage(summary.DailyUsage, chartFirst, chartLast, waiting);
 
-            var sortedTargets = summary.Targets.OrderByDescending(row => row.UploadBytes + row.DownloadBytes).ThenBy(row => row.Hostname).ThenBy(row => row.Address).ToList();
-            _targetTotalCount = sortedTargets.Count;
-            string search = TargetSearchBox.Text.Trim();
-            var targets = sortedTargets.Where(row => search.Length == 0 || TargetMatches(row, search))
-                .Select(row => new TargetDisplayRow { Source = row }).ToList();
-            _refreshingTargets = true;
-            try
+            if (dataChanged)
             {
-                SetGridItems(TargetsGrid, targets);
-                TargetsGrid.SelectedItem = _selectedTargetKey == null ? null : targets.FirstOrDefault(row => row.Key == _selectedTargetKey);
+                summary.Targets.Sort((a, b) =>
+                {
+                    int bytes = ((decimal)b.UploadBytes + b.DownloadBytes).CompareTo((decimal)a.UploadBytes + a.DownloadBytes);
+                    if (bytes != 0) return bytes;
+                    int host = StringComparer.CurrentCulture.Compare(a.Hostname, b.Hostname);
+                    return host != 0 ? host : StringComparer.CurrentCulture.Compare(a.Address, b.Address);
+                });
+                _sortedTargets = summary.Targets;
             }
-            finally { _refreshingTargets = false; }
-            UpdateTargetDetails();
+            var sortedTargets = _sortedTargets;
+            if (dashboardChanged) RefreshTargetItems();
             SetGridItems(ProcessesGrid, current.Processes.Select(row => new ProcessDisplayRow
             {
                 Name = row.Name, Pid = row.Pid, Kind = row.Application + (row.Kind == "tool" ? " 派生工具" : " 核心进程"),
@@ -215,14 +233,18 @@ public partial class MainWindow : Window
                 StartedAt = row.StartedAt, Duration = row.Duration, UploadBytes = row.UploadBytes, DownloadBytes = row.DownloadBytes,
                 UploadDisplay = Bytes(row.UploadBytes), DownloadDisplay = Bytes(row.DownloadBytes), TotalDisplay = Bytes(row.UploadBytes + row.DownloadBytes)
             }).ToList());
-            var destinations = sortedTargets.GroupBy(TargetName)
-                .Select(group => new { Name = group.Key, Bytes = group.Sum(row => row.UploadBytes + row.DownloadBytes), Rows = group })
-                .OrderByDescending(row => row.Bytes).Take(5)
-                .Select(row => new { row.Name, row.Bytes, Details = string.Join("\n", row.Rows.Select(target => FormatAddress(target.Address, target.Port)).Distinct().Take(8)) }).ToList();
-            double rankMaximum = destinations.Count == 0 ? 1 : Math.Max(1, destinations[0].Bytes);
-            RankingList.ItemsSource = destinations.Select((row, index) => new RankingDisplayRow { Rank = (index + 1).ToString(), Name = row.Name, Details = row.Details + "\n占当前范围 " + (total > 0 ? row.Bytes * 100d / total : 0).ToString("0.0") + "% · 点击筛选", Display = Bytes(row.Bytes), UsedWidth = new GridLength(Math.Max(.001, row.Bytes / rankMaximum), GridUnitType.Star), RemainingWidth = new GridLength(Math.Max(.001, 1 - row.Bytes / rankMaximum), GridUnitType.Star) }).ToList();
-            RankingEmptyText.Visibility = destinations.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-            RankingEmptyText.Text = waiting ? "正在汇总历史用量…" : _trafficScope == DashboardTrafficScope.Proxy ? "当前范围暂无已确认代理流量" : "当前范围暂无流量记录";
+            if (dashboardChanged)
+            {
+                var destinations = sortedTargets.GroupBy(TargetName)
+                    .Select(group => new { Name = group.Key, Bytes = group.Sum(row => row.UploadBytes + row.DownloadBytes), Rows = group })
+                    .OrderByDescending(row => row.Bytes).Take(5)
+                    .Select(row => new { row.Name, row.Bytes, Details = string.Join("\n", row.Rows.Select(target => FormatAddress(target.Address, target.Port)).Distinct().Take(8)) }).ToList();
+                double rankMaximum = destinations.Count == 0 ? 1 : Math.Max(1, destinations[0].Bytes);
+                RankingList.ItemsSource = destinations.Select((row, index) => new RankingDisplayRow { Rank = (index + 1).ToString(), Name = row.Name, Details = row.Details + "\n占当前范围 " + (total > 0 ? row.Bytes * 100d / total : 0).ToString("0.0") + "% · 点击筛选", Display = Bytes(row.Bytes), UsedWidth = new GridLength(Math.Max(.001, row.Bytes / rankMaximum), GridUnitType.Star), RemainingWidth = new GridLength(Math.Max(.001, 1 - row.Bytes / rankMaximum), GridUnitType.Star) }).ToList();
+                RankingEmptyText.Visibility = destinations.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+                RankingEmptyText.Text = waiting ? "正在汇总历史用量…" : _trafficScope == DashboardTrafficScope.Proxy ? "当前范围暂无已确认代理流量" : "当前范围暂无流量记录";
+            }
+            if (SettingsPopup.IsOpen) UpdateResourceStatus();
 
             StatusText.Text = _demo ? "演示预览" : current.CaptureStatus;
             Color active = Color.FromRgb(22, 143, 106);
@@ -285,20 +307,84 @@ public partial class MainWindow : Window
         if (route.Contains("保留", StringComparison.Ordinal)) return "保留地址";
         return route;
     }
-    private static bool TargetMatches(TargetRow row, string search) => new[] { row.Application.ToString(), row.Hostname, row.Address, row.Target, row.ProxyDestination, row.Process, row.Region, row.ProxyNode, row.ProxyChain, row.ProxyType, TrafficKindLabel(row.TrafficKind), ConnectionPresentation.RegionLabel(row), ConnectionPresentation.NodeLabel(row), ConnectionPresentation.NodeContext(row) }.Any(value => value?.Contains(search, StringComparison.OrdinalIgnoreCase) == true);
+    private static bool TargetMatches(TargetRow row, string search)
+    {
+        // Stop at the first matching field. Common domain/IP searches need no
+        // temporary field array or formatting of region and node descriptions.
+        static bool Contains(string? value, string text) => value?.Contains(text, StringComparison.OrdinalIgnoreCase) == true;
+        string application = row.Application switch
+        {
+            TrackedApplication.Codex => nameof(TrackedApplication.Codex),
+            TrackedApplication.Claude => nameof(TrackedApplication.Claude),
+            _ => row.Application.ToString()
+        };
+        return Contains(application, search) || Contains(row.Hostname, search) || Contains(row.Address, search) ||
+            Contains(row.Target, search) || Contains(row.ProxyDestination, search) || Contains(row.Process, search) ||
+            Contains(row.Region, search) || Contains(row.ProxyNode, search) || Contains(row.ProxyChain, search) ||
+            Contains(row.ProxyType, search) || Contains(TrafficKindLabel(row.TrafficKind), search) ||
+            Contains(ConnectionPresentation.RegionLabel(row), search) || Contains(ConnectionPresentation.NodeLabel(row), search) ||
+            Contains(ConnectionPresentation.NodeContext(row), search);
+    }
     private static bool SessionInRange(SessionRow row, DashboardSnapshot summary) => !summary.FromUtc.HasValue || (DateTime.TryParse(row.StartedAt, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out var started) && started.ToUniversalTime() >= summary.FromUtc.Value && started.ToUniversalTime() <= summary.ToUtc);
+
+    private void RefreshTargetItems()
+    {
+        _targetTotalCount = _sortedTargets.Count;
+        string search = TargetSearchBox.Text.Trim();
+        var targets = _sortedTargets.Where(row => search.Length == 0 || TargetMatches(row, search))
+            .Select(row => new TargetDisplayRow { Source = row }).ToList();
+        _refreshingTargets = true;
+        try
+        {
+            SetGridItems(TargetsGrid, targets);
+            TargetsGrid.SelectedItem = _selectedTargetKey == null ? null : targets.FirstOrDefault(row => TargetIdentity(row.Source) == _selectedTargetKey);
+        }
+        finally { _refreshingTargets = false; }
+        UpdateTargetDetails();
+    }
 
     private void SetGridItems(DataGrid grid, System.Collections.IEnumerable rows)
     {
         var scroller = FindVisualChild<ScrollViewer>(grid);
-        double offset = scroller?.VerticalOffset ?? 0;
-        var view = CollectionViewSource.GetDefaultView(rows);
+        double offset = _suspendedScrollOffsets.Remove(grid.Name, out double savedOffset) ? savedOffset : scroller?.VerticalOffset ?? 0;
+        // This window owns the view's lifetime. A default view also enters WPF's
+        // shared collection-view cache and can retain discarded history lists.
+        var view = new ListCollectionView((System.Collections.IList)rows);
         var sort = _sorts[grid.Name];
         grid.ItemsSource = view;
         view.SortDescriptions.Add(new SortDescription(sort.Property, sort.Direction));
         foreach (var column in grid.Columns) column.SortDirection = column.SortMemberPath == sort.Property ? sort.Direction : null;
         if (offset > 0)
-            Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() => { if (!_disposed) scroller?.ScrollToVerticalOffset(offset); }));
+            Dispatcher.BeginInvoke(DispatcherPriority.ContextIdle, new Action(() =>
+            {
+                if (_disposed || !IsVisible || !ReferenceEquals(grid.ItemsSource, view)) return;
+                grid.UpdateLayout();
+                FindVisualChild<ScrollViewer>(grid)?.ScrollToVerticalOffset(offset);
+            }));
+    }
+
+    private void ReleaseDashboardView()
+    {
+        // Capture and history indexing continue in the engine. Hidden WPF views
+        // need no detached copy of every destination or its formatted bindings.
+        SettingsPopup.IsOpen = false;
+        _refreshingTargets = true;
+        try
+        {
+            foreach (var grid in new[] { TargetsGrid, ProcessesGrid, SessionsGrid })
+            {
+                var scroller = FindVisualChild<ScrollViewer>(grid);
+                _suspendedScrollOffsets.TryAdd(grid.Name, scroller?.VerticalOffset ?? 0);
+                grid.ItemsSource = null;
+            }
+        }
+        finally { _refreshingTargets = false; }
+        RankingList.ItemsSource = null;
+        _dashboard = null;
+        _dashboardVersion = null;
+        _sortedTargets = new();
+        DetailTitleText.Text = "";
+        DetailBodyText.Text = "";
     }
 
     private static T? FindVisualChild<T>(DependencyObject parent) where T : DependencyObject
@@ -388,7 +474,43 @@ public partial class MainWindow : Window
         }
     }
 
-    private void SettingsButton_Click(object sender, RoutedEventArgs e) => SettingsPopup.IsOpen = !SettingsPopup.IsOpen;
+    private void SettingsButton_Click(object sender, RoutedEventArgs e)
+    {
+        SettingsPopup.IsOpen = !SettingsPopup.IsOpen;
+        if (SettingsPopup.IsOpen) UpdateResourceStatus();
+    }
+
+    private void UpdateResourceStatus()
+    {
+        var sample = _resourceSampler.Read();
+        ResourceStatusText.Text = "内存 " + Bytes(sample.WorkingSetBytes) + " · CPU " + (sample.CpuPercent?.ToString("0.00", CultureInfo.InvariantCulture) ?? "…") + "%";
+        ResourceStatusText.ToolTip = "当前程序的驻留内存；CPU 按本机全部逻辑处理器归一化。首次采样后显示 CPU。";
+    }
+
+    private async void ExportDiagnosticsButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_exportingDiagnostics || _demo) return;
+        var dialog = new SaveFileDialog { Filter = "运行诊断 JSON|*.json", FileName = "traffic-diagnostics-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".json" };
+        if (dialog.ShowDialog(this) != true) return;
+        _exportingDiagnostics = true;
+        ExportDiagnosticsButton.IsEnabled = false;
+        ExportDiagnosticsButton.Content = "采样中（5 秒）…";
+        try
+        {
+            var report = await ResourceDiagnostics.MeasureAsync(Environment.ProcessId, TimeSpan.FromSeconds(5), _updateCancellation.Token);
+            report.CaptureRunning = _engine.IsRunning;
+            report.EventsLost = _snapshot?.EventsLost ?? 0;
+            await File.WriteAllTextAsync(dialog.FileName, System.Text.Json.JsonSerializer.Serialize(report, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }), _updateCancellation.Token);
+            if (!_disposed) ResourceStatusText.Text = "运行诊断已保存";
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception exception) { if (!_disposed) ShowError("诊断导出失败", exception.Message); }
+        finally
+        {
+            _exportingDiagnostics = false;
+            if (!_disposed) { ExportDiagnosticsButton.IsEnabled = true; ExportDiagnosticsButton.Content = "导出运行诊断"; }
+        }
+    }
     private async void CheckUpdateButton_Click(object sender, RoutedEventArgs e)
     {
         if (_checkingUpdate || _disposed) return;
@@ -499,7 +621,20 @@ public partial class MainWindow : Window
         if (_loading) return;
         SearchPlaceholder.Visibility = string.IsNullOrEmpty(TargetSearchBox.Text) ? Visibility.Visible : Visibility.Collapsed;
         ClearSearchButton.Visibility = string.IsNullOrEmpty(TargetSearchBox.Text) ? Visibility.Collapsed : Visibility.Visible;
-        RefreshSnapshot(false);
+        if (_disposed || !IsVisible && !_demo && string.IsNullOrWhiteSpace(PreviewOutputPath)) return;
+        if (_dashboard == null) { RefreshSnapshot(false); return; }
+        try
+        {
+            // Typing only changes the destination filter. Keep the chart,
+            // rankings and live/session views attached to their current data.
+            RefreshTargetItems();
+            UpdateEmptyState();
+        }
+        catch (Exception exception)
+        {
+            CaptureHintText.Text = "刷新失败：" + exception.Message;
+            CaptureHintText.ToolTip = exception.ToString();
+        }
     }
     private void StartButton_Click(object sender, RoutedEventArgs e)
         => ToggleMonitoring();

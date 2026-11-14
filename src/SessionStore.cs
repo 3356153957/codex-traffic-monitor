@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Globalization;
 using System.IO;
 using System.Text;
@@ -8,14 +9,20 @@ namespace CodexTraffic;
 public sealed class SessionStore : IDisposable
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    private static readonly TimeSpan SummaryHeartbeat = TimeSpan.FromSeconds(30);
     private readonly FileStream _flowStream;
+    private readonly Func<DateTime> _utcNow;
+    private bool _summaryWritten;
     public string DirectoryPath { get; }
     public string LogFile => Path.Combine(DirectoryPath, "flows.jsonl");
-    public SessionRecord Record { get; }
+    public SessionRecord Record { get; private set; }
 
-    public SessionStore(string dataDirectory, bool children, bool loopback)
+    public SessionStore(string dataDirectory, bool children, bool loopback) : this(dataDirectory, children, loopback, () => DateTime.UtcNow) { }
+
+    internal SessionStore(string dataDirectory, bool children, bool loopback, Func<DateTime> utcNow)
     {
-        var now = DateTime.UtcNow;
+        _utcNow = utcNow;
+        var now = _utcNow();
         string id = now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture) + "-" + Guid.NewGuid().ToString("N")[..8];
         DirectoryPath = Path.Combine(dataDirectory, "sessions", id);
         Directory.CreateDirectory(DirectoryPath);
@@ -28,13 +35,34 @@ public sealed class SessionStore : IDisposable
 
     public void Append(IEnumerable<FlowRecord> rows)
     {
-        string block = string.Join("\n", rows.Select(row => JsonSerializer.Serialize(row)));
-        if (block.Length == 0) return;
-        byte[] bytes = Encoding.UTF8.GetBytes(block + "\n");
         long checkpoint = _flowStream.Position;
-        try { _flowStream.Write(bytes); _flowStream.Flush(true); }
+        try
+        {
+            // Reuse one UTF-8 writer for the batch instead of retaining every
+            // JSON string, a joined UTF-16 copy and a full UTF-8 copy at once.
+            bool wrote = false;
+            var buffer = new ArrayBufferWriter<byte>(1024);
+            using (var writer = new Utf8JsonWriter(buffer))
+            {
+                foreach (var row in rows)
+                {
+                    JsonSerializer.Serialize(writer, row);
+                    writer.Flush();
+                    // A buffer-backed writer keeps serializer Flush calls from
+                    // draining FileStream's write buffer for every single row.
+                    _flowStream.Write(buffer.WrittenSpan);
+                    _flowStream.WriteByte((byte)'\n');
+                    buffer.Clear();
+                    writer.Reset(buffer);
+                    wrote = true;
+                }
+            }
+            if (wrote) _flowStream.Flush(true);
+        }
         catch
         {
+            // Enumeration or serialization can now fail after writing rows.
+            // Roll back the complete batch so retry never duplicates its prefix.
             try { _flowStream.SetLength(checkpoint); _flowStream.Position = checkpoint; } catch { }
             throw;
         }
@@ -48,18 +76,33 @@ public sealed class SessionStore : IDisposable
         if (codexUp < 0 || codexDown < 0 || claudeUpload < 0 || claudeDownload < 0 ||
             checked(codexUp + claudeUpload) != up || checked(codexDown + claudeDownload) != down)
             throw new InvalidOperationException("应用流量分项与合计不一致，未写入会话摘要。");
-        Record.UpdatedUtc = DateTime.UtcNow;
-        Record.CodexUploadBytes = codexUp; Record.CodexDownloadBytes = codexDown;
-        Record.ClaudeUploadBytes = claudeUpload; Record.ClaudeDownloadBytes = claudeDownload;
-        Record.UploadBytes = up;
-        Record.DownloadBytes = down;
-        Record.EventsLost = lost;
-        if (error != null) { Record.Error = error; Record.Status = "error"; }
-        if (ended) { Record.EndedUtc = Record.UpdatedUtc; if (Record.Status != "error") Record.Status = "completed"; }
+        var now = _utcNow();
+        string nextError = error ?? Record.Error;
+        string nextStatus = error != null ? "error" : Record.Status;
+        if (ended && nextStatus != "error") nextStatus = "completed";
+        bool changed = Record.UploadBytes != up || Record.DownloadBytes != down || Record.EventsLost != lost ||
+            Record.CodexUploadBytes != codexUp || Record.CodexDownloadBytes != codexDown ||
+            Record.ClaudeUploadBytes != claudeUpload || Record.ClaudeDownloadBytes != claudeDownload ||
+            Record.Error != nextError || Record.Status != nextStatus || (ended && Record.EndedUtc == null);
+        // Keep crash-recovery duration within one heartbeat of the last tick,
+        // without rewriting unchanged summaries on every idle maintenance pass.
+        if (_summaryWritten && !changed && (Record.EndedUtc.HasValue || now - Record.UpdatedUtc < SummaryHeartbeat)) return;
+        var next = new SessionRecord
+        {
+            AccountingVersion = Record.AccountingVersion, Id = Record.Id, StartedUtc = Record.StartedUtc,
+            UpdatedUtc = now, EndedUtc = ended ? Record.EndedUtc ?? now : Record.EndedUtc,
+            IncludeChildren = Record.IncludeChildren, IncludeLoopback = Record.IncludeLoopback, ByteBasis = Record.ByteBasis,
+            CodexUploadBytes = codexUp, CodexDownloadBytes = codexDown, ClaudeUploadBytes = claudeUpload,
+            ClaudeDownloadBytes = claudeDownload, UploadBytes = up, DownloadBytes = down, EventsLost = lost,
+            Error = nextError, Status = nextStatus
+        };
         string file = Path.Combine(DirectoryPath, "session.json");
         string temporary = file + ".tmp";
-        File.WriteAllText(temporary, JsonSerializer.Serialize(Record, JsonOptions), new UTF8Encoding(false));
+        File.WriteAllText(temporary, JsonSerializer.Serialize(next, JsonOptions), new UTF8Encoding(false));
         File.Move(temporary, file, true);
+        // A failed atomic replacement must remain retryable with identical input.
+        Record = next;
+        _summaryWritten = true;
     }
 
     public static List<SessionRow> History(string dataDirectory, string? excludedId = null)

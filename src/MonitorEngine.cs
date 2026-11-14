@@ -28,13 +28,15 @@ public sealed class MonitorEngine : IDisposable
     private long _lastUp, _lastDown;
     private long _lastCodexUp, _lastCodexDown, _lastClaudeUp, _lastClaudeDown;
     private long _lastTicks = Stopwatch.GetTimestamp();
+    private long _lastCatalogRefreshTicks;
     private double _upRate, _downRate;
     private double _codexUpRate, _codexDownRate, _claudeUpRate, _claudeDownRate;
     private int _maintenanceActive;
     private int _disposeStarted;
     private List<ConnectionInfo> _connections = new();
     private List<SessionRow> _history = new();
-    private Dictionary<string, ConnectionInfo> _connectionMap = new();
+    private readonly record struct ConnectionIdentity(int Pid, string LocalAddress, int LocalPort, string RemoteAddress, int RemotePort);
+    private Dictionary<ConnectionIdentity, ConnectionInfo> _connectionMap = new();
 
     public bool IncludeChildren { get; set; } = true;
     public bool IncludeLoopback { get; set; } = true;
@@ -42,6 +44,7 @@ public sealed class MonitorEngine : IDisposable
     public bool IsAdmin { get; } = new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator);
     public bool IsRunning { get { lock (_gate) return _desired; } }
     public string LastError { get { lock (_gate) return _error; } }
+    internal object DashboardVersion => _analytics.PublishedVersion;
 
     public MonitorEngine(string? dataDirectory = null)
     {
@@ -71,6 +74,7 @@ public sealed class MonitorEngine : IDisposable
         try
         {
             _catalog.Refresh();
+            Interlocked.Exchange(ref _lastCatalogRefreshTicks, Stopwatch.GetTimestamp());
             session = new TraceEventSession("CodexTraffic-" + Environment.ProcessId) { StopOnDispose = true, BufferSizeMB = 64 };
             lock (_gate)
             {
@@ -90,7 +94,7 @@ public sealed class MonitorEngine : IDisposable
             // enabled before touching Source, or TraceEvent rejects this session.
             session.EnableKernelProvider(KernelTraceEventParser.Keywords.NetworkTCPIP | KernelTraceEventParser.Keywords.Process);
             var parser = session.Source.Kernel;
-            parser.ProcessStart += d => _catalog.RecordStarted(d.ProcessID, d.ParentID, d.ImageFileName, d.TimeStamp, executablePath: null, commandLine: d.CommandLine);
+            parser.ProcessStartGroup += d => _catalog.RecordStarted(d.ProcessID, d.ParentID, d.ImageFileName, d.TimeStamp, executablePath: null, commandLine: d.CommandLine);
             parser.ProcessStop += d => _catalog.RecordStopped(d.ProcessID, d.TimeStamp);
             parser.TcpIpSend += d => Transfer(d.TimeStamp, d.ProcessID, "TCP", true, d.saddr, d.sport, d.daddr, d.dport, d.size);
             parser.TcpIpRecv += d => Transfer(d.TimeStamp, d.ProcessID, "TCP", false, d.saddr, d.sport, d.daddr, d.dport, d.size);
@@ -100,6 +104,10 @@ public sealed class MonitorEngine : IDisposable
             parser.UdpIpRecv += d => Transfer(d.TimeStamp, d.ProcessID, "UDP", false, d.saddr, d.sport, d.daddr, d.dport, d.size);
             parser.UdpIpSendIPV6 += d => Transfer(d.TimeStamp, d.ProcessID, "UDP6", true, d.saddr, d.sport, d.daddr, d.dport, d.size);
             parser.UdpIpRecvIPV6 += d => Transfer(d.TimeStamp, d.ProcessID, "UDP6", false, d.saddr, d.sport, d.daddr, d.dport, d.size);
+            // Close the initial native-snapshot/provider-enable gap. Process
+            // rundown supplements the second snapshot for already exiting roots.
+            _catalog.Refresh();
+            Interlocked.Exchange(ref _lastCatalogRefreshTicks, Stopwatch.GetTimestamp());
             lock (_gate) { if (!_desired) return; _running = true; }
             session.Source.Process();
             lock (_gate) if (_desired && _error.Length == 0) _error = "ETW 会话意外结束，请重新开始采集。";
@@ -111,6 +119,7 @@ public sealed class MonitorEngine : IDisposable
         finally
         {
             // Disposing only our uniquely named session never stops another profiler.
+            lock (_gate) ReadLostEvents(session);
             try { session?.Dispose(); } catch { }
             lock (_gate)
             {
@@ -163,16 +172,30 @@ public sealed class MonitorEngine : IDisposable
         }
     }
 
-    private static string ConnectionKey(int pid, string a, int ap, string b, int bp) => $"{pid}|{a}|{ap}|{b}|{bp}";
+    private static ConnectionIdentity ConnectionKey(int pid, string a, int ap, string b, int bp) => new(pid, a, ap, b, bp);
 
     private void Maintain()
     {
         if (_disposed || Interlocked.Exchange(ref _maintenanceActive, 1) != 0) return;
         try
         {
-            _catalog.Refresh();
-            var connections = ConnectionReader.GetTcpConnections().ToList();
-            var map = new Dictionary<string, ConnectionInfo>();
+            bool running;
+            lock (_gate) running = _running;
+            long refreshNow = Stopwatch.GetTimestamp();
+            // ETW process start/stop events keep active capture identities current,
+            // including tools that start and exit between full snapshots. A slower
+            // snapshot is only a recovery path while the kernel stream is active.
+            if (!running || Stopwatch.GetElapsedTime(Interlocked.Read(ref _lastCatalogRefreshTicks), refreshNow) >= TimeSpan.FromSeconds(5))
+            {
+                _catalog.Refresh();
+                Interlocked.Exchange(ref _lastCatalogRefreshTicks, Stopwatch.GetTimestamp());
+            }
+            var trackedIds = _catalog.List(IncludeChildren).Select(p => p.Pid).ToHashSet();
+            // The system table contains unrelated applications as well. With no
+            // tracked owners there is nothing to display or resolve from that table.
+            var connections = trackedIds.Count == 0 ? new List<ConnectionInfo>()
+                : ConnectionReader.GetTcpConnections().Where(c => trackedIds.Contains(c.Pid)).ToList();
+            var map = new Dictionary<ConnectionIdentity, ConnectionInfo>(connections.Count);
             foreach (var c in connections)
             {
                 map[ConnectionKey(c.Pid, c.LocalAddress, c.LocalPort, c.RemoteAddress, c.RemotePort)] = c;
@@ -194,7 +217,7 @@ public sealed class MonitorEngine : IDisposable
                 _lastUp = _ledger.UploadBytes; _lastDown = _ledger.DownloadBytes; _lastTicks = now;
                 if (_running)
                 {
-                    _lost = _session?.EventsLost ?? _lost;
+                    ReadLostEvents(_session);
                     try { Flush(); }
                     catch (Exception e)
                     {
@@ -203,6 +226,7 @@ public sealed class MonitorEngine : IDisposable
                         ThreadPool.QueueUserWorkItem(_ => Stop());
                     }
                 }
+                _ledger.TrimIdleBuffers(DateTime.UtcNow);
             }
             _analytics.Refresh();
         }
@@ -216,10 +240,12 @@ public sealed class MonitorEngine : IDisposable
     private void Flush()
     {
         if (_store == null) return;
+        if (!_ledger.HasPending) { UpdateStore(); return; }
         var pending = _ledger.Pending();
         foreach (var row in pending)
         {
-            var hint = _proxy.Lookup(row.Pid, row.LocalAddress, row.LocalPort, row.RemoteAddress, row.RemotePort, row.TimestampUtc);
+            var hint = _proxy.Lookup(row.Pid, row.LocalAddress, row.LocalPort, row.RemoteAddress, row.RemotePort,
+                row.TimestampUtc, row.LastTimestampUtc == default ? row.TimestampUtc : row.LastTimestampUtc);
             if (hint != null) _ledger.Annotate(row, hint);
             else _ledger.MarkUnconfirmed(row);
             if (row.Region.Length == 0)
@@ -241,34 +267,31 @@ public sealed class MonitorEngine : IDisposable
     {
         var tracked = _catalog.List(IncludeChildren).Where(p => ApplicationFilter.Matches(p.Application, applicationScope)).ToList();
         var trackedIds = tracked.Select(p => p.Pid).ToHashSet();
+        var trackedById = tracked.ToDictionary(p => p.Pid);
+        List<TargetRow> targets;
+        List<ProcessRow> processes;
+        List<SessionRow> sessions;
+        long codexUploadBytes, codexDownloadBytes, claudeUploadBytes, claudeDownloadBytes;
+        long uploadBytes, downloadBytes, eventsLost;
+        double uploadBytesPerSecond, downloadBytesPerSecond;
+        DateTime? startedAt;
+        string captureStatus, warning, logFile;
+        int connectionCount;
+        DateTime capturedAt;
+        bool capturedTargets;
         lock (_gate)
         {
-            var targets = includeTargets ? _ledger.Targets(applicationScope) : new List<TargetRow>();
+            // Copy the mutable accounting state while holding the gate, then do
+            // optional proxy/DNS/GeoIP work after releasing it. ETW callbacks
+            // must keep ingesting packets while the UI asks for a snapshot.
+            capturedAt = DateTime.Now;
+            capturedTargets = _startedAt.HasValue;
+            targets = includeTargets ? _ledger.CopyTargets(applicationScope) : new List<TargetRow>();
             if (includeTargets && _startedAt == null)
                 targets = _connections.Where(c => trackedIds.Contains(c.Pid) && c.RemotePort != 0 && (IncludeLoopback || !IPAddress.IsLoopback(IPAddress.Parse(c.RemoteAddress))))
-                    .Select(c => new TargetRow { Application = _catalog.Get(c.Pid)?.Application ?? TrackedApplication.Codex, Address = c.RemoteAddress, Port = c.RemotePort, LocalAddress = c.LocalAddress, LocalPort = c.LocalPort, Target = AddressClassifier.Endpoint(c.RemoteAddress, c.RemotePort), Process = _catalog.Get(c.Pid)?.Name ?? "未知", Pid = c.Pid, Protocol = c.Protocol, Route = AddressClassifier.Classify(IPAddress.Parse(c.RemoteAddress)) }).ToList();
-            var processes = _ledger.Processes(applicationScope);
-            foreach (var target in targets)
-            {
-                if (!string.IsNullOrEmpty(target.Hostname)) continue;
-                var hint = _proxy.Lookup(target.Pid, target.LocalAddress, target.LocalPort, target.Address, target.Port);
-                if (hint != null)
-                {
-                    target.Hostname = !string.IsNullOrEmpty(hint.Host) ? hint.Host : _dns.Lookup(target.Address);
-                    target.DomainSource = !string.IsNullOrEmpty(hint.Host) ? "代理报告" : "DNS 缓存";
-                    target.ProxyDestination = AddressClassifier.Endpoint(string.IsNullOrEmpty(hint.DestinationAddress) ? hint.Host : hint.DestinationAddress, hint.DestinationPort);
-                    target.ProxyChain = hint.Chain;
-                    target.ProxyNode = hint.Node;
-                    target.ProxyType = hint.OutboundType;
-                    target.Region = hint.Region;
-                    target.RegionSource = hint.Region.Length > 0 ? "代理报告的目标 GeoIP" : "";
-                }
-                else { target.Hostname = _dns.Lookup(target.Address); target.DomainSource = "DNS 缓存"; }
-            }
-            foreach (var target in targets) { _geo.Enrich(target); TrafficClassifier.Apply(target); }
-            foreach (var p in tracked)
-                if (!processes.Any(x => x.Pid == p.Pid && x.Application == p.Application)) processes.Add(new ProcessRow { Application = p.Application, Name = p.Name, Pid = p.Pid, Kind = p.Kind });
-            var sessions = _history.Select(row => SelectSession(row, applicationScope))
+                    .Select(c => new TargetRow { Application = trackedById[c.Pid].Application, Address = c.RemoteAddress, Port = c.RemotePort, LocalAddress = c.LocalAddress, LocalPort = c.LocalPort, Target = AddressClassifier.Endpoint(c.RemoteAddress, c.RemotePort), Process = trackedById[c.Pid].Name, Pid = c.Pid, Protocol = c.Protocol, Route = AddressClassifier.Classify(IPAddress.Parse(c.RemoteAddress)) }).ToList();
+            processes = _ledger.Processes(applicationScope);
+            sessions = _history.Select(row => SelectSession(row, applicationScope))
                 .Where(row => applicationScope == DashboardApplicationScope.Total || row.UploadBytes > 0 || row.DownloadBytes > 0).ToList();
             if (_store != null)
                 sessions.Insert(0, SelectSession(new SessionRow { AccountingVersion = 2,
@@ -282,27 +305,55 @@ public sealed class MonitorEngine : IDisposable
                 DashboardApplicationScope.Claude => (_claudeUpRate, _claudeDownRate),
                 _ => (_upRate, _downRate)
             };
-            return new MonitorSnapshot
-            {
-                ApplicationScope = applicationScope, CodexUploadBytes = _ledger.CodexUploadBytes, CodexDownloadBytes = _ledger.CodexDownloadBytes,
-                ClaudeUploadBytes = _ledger.ClaudeUploadBytes, ClaudeDownloadBytes = _ledger.ClaudeDownloadBytes,
-                CapturedAt = DateTime.Now, StartedAt = _startedAt, UploadBytes = totals.Upload, DownloadBytes = totals.Download,
-                UploadBytesPerSecond = rates.Item1, DownloadBytesPerSecond = rates.Item2, ProcessCount = tracked.Count,
-                ConnectionCount = _connections.Count(c => trackedIds.Contains(c.Pid) && c.RemotePort != 0), EventsLost = _lost,
-                HasCapturedData = _startedAt.HasValue, Targets = targets, Processes = processes.OrderByDescending(x => x.UploadBytes + x.DownloadBytes).ToList(), Sessions = sessions,
-                CaptureStatus = _running ? "正在记录" : _desired ? "正在启动" : _startedAt.HasValue ? "已停止记录" : "连接查看 · 未计量",
-                Warning = _lost > 0 ? $"ETW 丢失 {_lost:N0} 个事件，统计可能偏低。" : "记录 Codex / Claude 进程的直接网络连接；回环可能是本地代理，虚拟地址无法还原最终网站。", LogFile = _logFile
-            };
+            codexUploadBytes = _ledger.CodexUploadBytes; codexDownloadBytes = _ledger.CodexDownloadBytes;
+            claudeUploadBytes = _ledger.ClaudeUploadBytes; claudeDownloadBytes = _ledger.ClaudeDownloadBytes;
+            uploadBytes = totals.Upload; downloadBytes = totals.Download; eventsLost = _lost;
+            uploadBytesPerSecond = rates.Item1; downloadBytesPerSecond = rates.Item2;
+            startedAt = _startedAt; connectionCount = _connections.Count(c => trackedIds.Contains(c.Pid) && c.RemotePort != 0);
+            captureStatus = _running ? "正在记录" : _desired ? "正在启动" : _startedAt.HasValue ? "已停止记录" : "连接查看 · 未计量";
+            warning = _lost > 0 ? $"ETW 丢失 {_lost:N0} 个事件，统计可能偏低。" : "记录 Codex / Claude 进程的直接网络连接；回环可能是本地代理，虚拟地址无法还原最终网站。";
+            logFile = _logFile;
         }
+
+        if (capturedTargets) targets = targets.OrderByDescending(x => x.UploadBytes + x.DownloadBytes).ToList();
+        var processIds = processes.Select(p => (p.Pid, p.Application)).ToHashSet();
+        foreach (var p in tracked)
+            if (processIds.Add((p.Pid, p.Application))) processes.Add(new ProcessRow { Application = p.Application, Name = p.Name, Pid = p.Pid, Kind = p.Kind });
+        foreach (var target in targets)
+        {
+            if (!string.IsNullOrEmpty(target.Hostname)) continue;
+            var hint = _proxy.Lookup(target.Pid, target.LocalAddress, target.LocalPort, target.Address, target.Port);
+            if (hint != null)
+            {
+                target.Hostname = !string.IsNullOrEmpty(hint.Host) ? hint.Host : _dns.Lookup(target.Address);
+                target.DomainSource = !string.IsNullOrEmpty(hint.Host) ? "代理报告" : "DNS 缓存";
+                target.ProxyDestination = AddressClassifier.Endpoint(string.IsNullOrEmpty(hint.DestinationAddress) ? hint.Host : hint.DestinationAddress, hint.DestinationPort);
+                target.ProxyChain = hint.Chain;
+                target.ProxyNode = hint.Node;
+                target.ProxyType = hint.OutboundType;
+                target.Region = hint.Region;
+                target.RegionSource = hint.Region.Length > 0 ? "代理报告的目标 GeoIP" : "";
+            }
+            else { target.Hostname = _dns.Lookup(target.Address); target.DomainSource = "DNS 缓存"; }
+        }
+        foreach (var target in targets) { _geo.Enrich(target); TrafficClassifier.Apply(target); }
+        return new MonitorSnapshot
+        {
+            ApplicationScope = applicationScope, CodexUploadBytes = codexUploadBytes, CodexDownloadBytes = codexDownloadBytes,
+            ClaudeUploadBytes = claudeUploadBytes, ClaudeDownloadBytes = claudeDownloadBytes,
+            CapturedAt = capturedAt, StartedAt = startedAt, UploadBytes = uploadBytes, DownloadBytes = downloadBytes,
+            UploadBytesPerSecond = uploadBytesPerSecond, DownloadBytesPerSecond = downloadBytesPerSecond, ProcessCount = tracked.Count,
+            ConnectionCount = connectionCount, EventsLost = eventsLost, HasCapturedData = startedAt.HasValue,
+            Targets = targets, Processes = processes.OrderByDescending(x => x.UploadBytes + x.DownloadBytes).ToList(), Sessions = sessions,
+            CaptureStatus = captureStatus, Warning = warning, LogFile = logFile
+        };
     }
 
     public void ExportCsv(string path)
     {
-        lock (_gate)
-        {
-            if (_startedAt == null) throw new InvalidOperationException("尚未开始流量采集，当前只有连接信息。请先以管理员身份开始记录。");
-            SessionStore.WriteCsv(path, GetSnapshot().Targets);
-        }
+        var snapshot = GetSnapshot();
+        if (!snapshot.HasCapturedData) throw new InvalidOperationException("尚未开始流量采集，当前只有连接信息。请先以管理员身份开始记录。");
+        SessionStore.WriteCsv(path, snapshot.Targets);
     }
 
     private static SessionRow SelectSession(SessionRow row, DashboardApplicationScope scope) => new()
@@ -332,8 +383,15 @@ public sealed class MonitorEngine : IDisposable
     public void Stop()
     {
         TraceEventSession? session;
-        lock (_gate) { _desired = false; session = _session; }
+        lock (_gate) { _desired = false; session = _session; ReadLostEvents(session); }
         try { session?.Dispose(); } catch { }
+    }
+
+    private void ReadLostEvents(TraceEventSession? session)
+    {
+        if (session == null) return;
+        try { _lost = Math.Max(_lost, session.EventsLost); }
+        catch { /* Session teardown can race this optional last status query. */ }
     }
 
     public void Dispose()
