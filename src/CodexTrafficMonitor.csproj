@@ -22,7 +22,7 @@
     <Resource Include="Assets\app.ico" />
     <Using Remove="System.Windows.Forms" />
     <Using Remove="System.Drawing" />
-    <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="3.2.8" />
-    <PackageReference Include="MaxMind.Db" Version="5.2.0" />
+    <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="4.0.2" />
+    <PackageReference Include="MaxMind.Db" Version="5.3.0" />
   </ItemGroup>
 </Project>
