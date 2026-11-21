@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 $taskRoot = $PSScriptRoot
 $destination = if ($OutputDirectory) { [IO.Path]::GetFullPath($OutputDirectory) } else { Join-Path $taskRoot 'output\release' }
 $payload = Join-Path $destination 'payload'
-$project = [xml](Get-Content -LiteralPath (Join-Path $taskRoot 'src\CodexTrafficMonitor.csproj') -Raw)
+$project = [xml](Get-Content -Encoding UTF8 -LiteralPath (Join-Path $taskRoot 'src\CodexTrafficMonitor.csproj') -Raw)
 $version = [string]$project.Project.PropertyGroup.Version
 if (-not $InnoCompiler) { $InnoCompiler = & (Join-Path $taskRoot 'tools\ensure-inno-setup.ps1') }
 & (Join-Path $taskRoot 'build.ps1') -OutputDirectory $payload -SkipTests:$SkipTests

@@ -99,7 +99,7 @@ try {
     if (!$StartClientAfterCapture) {
         $client = Start-FixtureClient
         Wait-File (Join-Path $RunDirectory 'client-ready.json')
-        $clientReady = Get-Content -LiteralPath (Join-Path $RunDirectory 'client-ready.json') -Raw | ConvertFrom-Json
+        $clientReady = Get-Content -Encoding UTF8 -LiteralPath (Join-Path $RunDirectory 'client-ready.json') -Raw | ConvertFrom-Json
     }
     $captureOutput = Join-Path $RunDirectory 'capture.json'
     $probeData = Join-Path $RunDirectory 'probe-data'
@@ -140,16 +140,16 @@ try {
     if ($StartClientAfterCapture) {
         $client = Start-FixtureClient
         Wait-File (Join-Path $RunDirectory 'client-ready.json')
-        $clientReady = Get-Content -LiteralPath (Join-Path $RunDirectory 'client-ready.json') -Raw | ConvertFrom-Json
+        $clientReady = Get-Content -Encoding UTF8 -LiteralPath (Join-Path $RunDirectory 'client-ready.json') -Raw | ConvertFrom-Json
         $plan.ClientPid = $clientReady.pid; $plan.ClientStartedUtc = $clientReady.startedUtc
         Save-Json $plan (Join-Path $RunDirectory 'diagnostic-plan.json')
     }
     New-Item -ItemType File -Path (Join-Path $RunDirectory 'start-traffic') | Out-Null
     Wait-File (Join-Path $RunDirectory 'client-result.json') 90
-    $clientResult = Get-Content -LiteralPath (Join-Path $RunDirectory 'client-result.json') -Raw | ConvertFrom-Json
+    $clientResult = Get-Content -Encoding UTF8 -LiteralPath (Join-Path $RunDirectory 'client-result.json') -Raw | ConvertFrom-Json
     if (-not $clientResult.success) { throw 'Socket client failed; inspect client-result.json.' }
     Wait-File (Join-Path $RunDirectory 'server-result.json') 30
-    $serverResult = Get-Content -LiteralPath (Join-Path $RunDirectory 'server-result.json') -Raw | ConvertFrom-Json
+    $serverResult = Get-Content -Encoding UTF8 -LiteralPath (Join-Path $RunDirectory 'server-result.json') -Raw | ConvertFrom-Json
     if (-not $clientResult.success -or -not $serverResult.success) { throw 'Socket fixture failed; inspect client-result.json and server-result.json.' }
     foreach ($channel in $clientResult.channels) {
         if ($channel.UploadBytes -ne 262144 -or $channel.DownloadBytes -ne 131072) { throw "Unexpected fixture byte count: $($channel.Name)" }
@@ -159,12 +159,12 @@ try {
     } else {
         Wait-File $captureOutput $CaptureWaitSeconds
         if ($null -ne $captureProcess) { $captureProcess.WaitForExit(5000) | Out-Null }
-        $capture = Get-Content -LiteralPath $captureOutput -Raw | ConvertFrom-Json
+        $capture = Get-Content -Encoding UTF8 -LiteralPath $captureOutput -Raw | ConvertFrom-Json
         if (-not $capture.PSObject.Properties['snapshot']) { throw 'Capture produced no snapshot; inspect capture.json.' }
         $flowFile = Join-Path (Split-Path -Parent $sessionFile) 'flows.jsonl'
         $clientStart = ([DateTime]$clientReady.startedUtc).ToUniversalTime()
         $clientEnd = ([DateTime]$clientResult.completedUtc).ToUniversalTime()
-        $flows = @(Get-Content -LiteralPath $flowFile | Where-Object { $_.Trim().Length -gt 0 } | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.Pid -eq $clientReady.pid -and ([DateTime]$_.TimestampUtc).ToUniversalTime() -ge $clientStart -and ([DateTime]$_.TimestampUtc).ToUniversalTime() -le $clientEnd })
+        $flows = @(Get-Content -Encoding UTF8 -LiteralPath $flowFile | Where-Object { $_.Trim().Length -gt 0 } | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.Pid -eq $clientReady.pid -and ([DateTime]$_.TimestampUtc).ToUniversalTime() -ge $clientStart -and ([DateTime]$_.TimestampUtc).ToUniversalTime() -le $clientEnd })
         $checks = @()
         foreach ($channel in $clientResult.channels) {
             $matching = @($flows | Where-Object { $_.Protocol -eq $channel.Protocol -and $_.RemoteAddress -eq $channel.Address -and $_.RemotePort -eq $channel.RemotePort -and $_.LocalPort -eq $channel.LocalPort })

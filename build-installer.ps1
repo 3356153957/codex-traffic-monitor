@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 $taskRoot = $PSScriptRoot
 $payload = if ($PayloadDirectory) { [IO.Path]::GetFullPath($PayloadDirectory) } else { Join-Path $taskRoot 'dist' }
 $destination = if ($OutputDirectory) { [IO.Path]::GetFullPath($OutputDirectory) } else { Join-Path $taskRoot 'output\release-installer' }
-$project = [xml](Get-Content -LiteralPath (Join-Path $taskRoot 'src\CodexTrafficMonitor.csproj') -Raw)
+$project = [xml](Get-Content -Encoding UTF8 -LiteralPath (Join-Path $taskRoot 'src\CodexTrafficMonitor.csproj') -Raw)
 $version = [string]$project.Project.PropertyGroup.Version
 if ($version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') { throw "不支持的安装版本：$version" }
 $executable = Join-Path $payload 'CodexTrafficMonitor.exe'

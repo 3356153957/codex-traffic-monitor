@@ -45,7 +45,7 @@ $dynamicHistory = [Collections.Generic.List[string]]::new()
 if (Test-Path -LiteralPath $historyDirectory) {
     foreach ($file in Get-ChildItem -LiteralPath $historyDirectory -File -Recurse | Where-Object { $_.Name -ne 'instance.lock' -and $_.Name -notlike '*.tmp' }) {
         $sessionSummary = Join-Path $file.DirectoryName 'session.json'
-        if ((Test-Path -LiteralPath $sessionSummary) -and -not ((Get-Content -LiteralPath $sessionSummary -Raw | ConvertFrom-Json).EndedUtc)) {
+        if ((Test-Path -LiteralPath $sessionSummary) -and -not ((Get-Content -Encoding UTF8 -LiteralPath $sessionSummary -Raw | ConvertFrom-Json).EndedUtc)) {
             $dynamicHistory.Add($file.FullName)
             continue
         }

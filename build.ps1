@@ -19,6 +19,6 @@ Copy-Item -LiteralPath (Join-Path $taskRoot 'LICENSE') -Destination $destination
 if (-not $SkipTests) {
     $test = Start-Process -FilePath (Join-Path $destination 'CodexTrafficMonitor.exe') -ArgumentList @('--self-test', ('"' + $testOutput + '"')) -PassThru -Wait -WindowStyle Hidden
     if ($test.ExitCode -ne 0) { throw "自测失败，请查看 $testOutput" }
-    Get-Content -LiteralPath $testOutput
+    Get-Content -Encoding UTF8 -LiteralPath $testOutput
 }
 Write-Host "已生成：$destination\CodexTrafficMonitor.exe"

@@ -42,7 +42,8 @@ jobs:
           $project = [xml](Get-Content ./src/CodexTrafficMonitor.csproj -Raw)
           if ($env:GITHUB_REF_NAME -ne "v$($project.Project.PropertyGroup.Version)") { throw 'Tag and application version differ.' }
       - name: Build, self-test, and package
-        shell: pwsh
+        # Windows PowerShell 5.1 is what users run; it reads BOM-less UTF-8 as ANSI.
+        shell: powershell
         run: ./build-release.ps1 -OutputDirectory "$env:RUNNER_TEMP/codex-traffic-release"
       - name: Upload installer and portable package
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
