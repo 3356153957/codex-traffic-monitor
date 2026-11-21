@@ -39,8 +39,19 @@ public static class StartupManager
         {
             string file = Path.Combine(DataDirectory, "settings.json");
             if (!File.Exists(file)) return new();
-            return JsonSerializer.Deserialize<CaptureOptions>(File.ReadAllText(file)) ?? new();
+            try { return ParseCaptureOptions(File.ReadAllText(file)); }
+            catch (IOException) { return new(); }
+            catch (UnauthorizedAccessException) { return new(); }
         }
+    }
+
+    // A damaged settings file must not stop the monitor (or its logon task) from
+    // starting. Defaults are used and the file is left untouched for inspection;
+    // the next explicit save replaces it atomically.
+    internal static CaptureOptions ParseCaptureOptions(string json)
+    {
+        try { return JsonSerializer.Deserialize<CaptureOptions>(json) ?? new(); }
+        catch (JsonException) { return new(); }
     }
 
     public static void SaveCaptureOptions(bool children, bool loopback)

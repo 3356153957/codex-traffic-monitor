@@ -1,4 +1,4 @@
-param([Parameter(Mandatory)][string]$InstallerPath)
+﻿param([Parameter(Mandatory)][string]$InstallerPath)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $installer = [IO.Path]::GetFullPath($InstallerPath)

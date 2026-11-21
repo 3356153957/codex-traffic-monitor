@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   build:
     runs-on: windows-latest
@@ -19,6 +23,18 @@ jobs:
       - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           dotnet-version: 8.0.x
+      - name: Parse scripts with Windows PowerShell 5.1
+        # Users run the build scripts from the default Windows PowerShell, which
+        # reads BOM-less UTF-8 as the ANSI code page and breaks Chinese strings.
+        shell: powershell
+        run: |
+          $failed = $false
+          foreach ($file in git ls-files '*.ps1') {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file), [ref]$null, [ref]$errors) | Out-Null
+            if ($errors) { $failed = $true; $errors | ForEach-Object { Write-Host "::error file=$file,line=$($_.Extent.StartLineNumber)::$($_.Message)" } }
+          }
+          if ($failed) { throw 'PowerShell 5.1 could not parse every script. Save scripts containing non-ASCII text as UTF-8 with BOM.' }
       - name: Verify release tag
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh

@@ -57,6 +57,9 @@ public static class SelfTests
             normalizedTask.Descendants(taskNs + "LogonTrigger").Single().Element(taskNs + "UserId")!.Value = System.Security.Principal.WindowsIdentity.GetCurrent().Name;
             Check(StartupManager.ParseStatus(normalizedTask.ToString(), false, StartupManager.UserSid, "test").Error.Length == 0, "Regression: Windows-normalized COMPUTER\\user login trigger matches the registered user's SID");
             Check(GeoIpHints.NodeFromChain("策略组 → 地区组 → sample node") == "sample node" && new CaptureOptions().IncludeChildren, "Derived tools default on and proxy node is distinct from a policy group");
+            Check(new[] { "{broken", "", "[]", "null", "{\"IncludeChildren\":\"yes\"}" }.All(x => StartupManager.ParseCaptureOptions(x) is { IncludeChildren: true, IncludeLoopback: true })
+                && StartupManager.ParseCaptureOptions("{\"IncludeChildren\":false,\"IncludeLoopback\":false}") is { IncludeChildren: false, IncludeLoopback: false },
+                "Regression: corrupt or empty capture settings fall back to defaults instead of blocking startup, while valid choices are kept");
             Check(AddressClassifier.Classify(IPAddress.Parse("127.0.0.1")).Contains("回环"), "IPv4 loopback is not a public destination");
             Check(AddressClassifier.Classify(IPAddress.Parse("::1")).Contains("回环"), "IPv6 loopback is not a public destination");
             Check(AddressClassifier.Classify(IPAddress.Parse("198.19.255.254")).Contains("虚拟"), "198.18/15 fake-IP range is explicit");

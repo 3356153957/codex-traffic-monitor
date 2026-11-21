@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$PayloadDirectory,
     [string]$OutputDirectory,
     [Alias('CompilerPath')][string]$InnoCompiler,
