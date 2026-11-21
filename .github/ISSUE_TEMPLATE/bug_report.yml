@@ -1,0 +1,46 @@
+name: 问题反馈
+description: 统计不准、程序报错、安装或开机自启异常
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请先移除个人信息：不要粘贴 `flows.jsonl`、CSV 导出、代理订阅、控制器密钥或完整域名清单。
+        “监控设置 → 资源占用”导出的运行诊断不含域名、进程路径和凭据，可以直接附上。
+  - type: input
+    id: version
+    attributes:
+      label: 程序版本
+      description: 在“监控设置”中查看，例如 1.5.6
+    validations:
+      required: true
+  - type: dropdown
+    id: package
+    attributes:
+      label: 安装方式
+      options:
+        - 安装版
+        - 便携版 ZIP
+        - 自行构建
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 版本
+      description: 例如 Windows 11 24H2
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: 问题描述与复现步骤
+      description: 做了什么、期望看到什么、实际看到什么
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 错误信息
+      description: 弹窗内容，或 `%LOCALAPPDATA%\CodexTrafficMonitor\errors.log` 中相关的几行（请先检查是否含个人路径）
+      render: text

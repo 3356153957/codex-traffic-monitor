@@ -1,5 +1,12 @@
 # 更新记录
 
+## 未发布
+
+- `settings.json` 损坏、为空或字段类型错误时改用默认采集选项，不再导致程序和开机任务无法启动；原文件保留，下次保存设置时原子替换。
+- 构建与安装脚本改为带 BOM 的 UTF-8，修复在 Windows 自带 PowerShell 5.1 中运行 `build.ps1` 等脚本时的中文解析错误；CI 增加 5.1 语法解析检查。
+- LICENSE 恢复为标准 MIT 文本，便于 GitHub 正确识别许可；第三方许可仍见 `THIRD-PARTY-NOTICES.txt`。
+- README 增加功能概览与状态徽章，实现细节移至 `docs/implementation-notes.md`；新增问题反馈模板与 Dependabot 配置。
+
 ## 1.5.6 · 2026-11-14
 
 - 监控面板读取快照时先复制账本、进程、会话和状态，再在锁外完成代理、DNS 与 GeoIP 补充；慢速名称解析不再阻塞 ETW 事件入账。
