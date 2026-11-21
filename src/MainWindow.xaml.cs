@@ -264,7 +264,7 @@ public partial class MainWindow : Window
             LoopbackCheck.IsEnabled = !running && !_demo;
             SessionTimeText.Text = current.StartedAt.HasValue ? "本次 " + ApplicationScopeLabel(_applicationScope) + " " + Bytes(current.UploadBytes + current.DownloadBytes) : "本次尚未开始";
             SessionTimeText.ToolTip = current.StartedAt.HasValue ? "本次监控自 " + current.StartedAt.Value.ToString("HH:mm:ss") + " 开始，顶部统计包含所选范围的历史记录。" : "点击开始监控，记录将自动保存在本机。";
-            WarningText.Text = "未知未取得足够代理报告，不等于直连；仅含已监控时段与 socket 流量。";
+            WarningText.Text = "“未知”表示未取得足够代理报告，不等于直连；仅含已监控时段与 socket 流量。";
             WarningText.ToolTip = string.Join("\n", new[] { WarningText.Text, summary.Warning, current.Warning }.Where(value => !string.IsNullOrWhiteSpace(value)).Distinct());
             if (current.EventsLost > 0) WarningText.Text += " 丢失事件 " + current.EventsLost + " 个。";
             string issue = !string.IsNullOrWhiteSpace(_engine.LastError) ? _engine.LastError : !string.IsNullOrWhiteSpace(summary.Warning) ? summary.Warning : current.EventsLost > 0 ? current.Warning : "";
@@ -836,7 +836,7 @@ public partial class MainWindow : Window
         EmptyState.Visibility = count == 0 ? Visibility.Visible : Visibility.Collapsed;
         bool searching = !string.IsNullOrWhiteSpace(TargetSearchBox.Text);
         EmptyTitle.Text = _selectedTab == "sessions" ? "当前范围没有历史会话" : _selectedTab == "processes" ? "暂未发现" + (_applicationScope == DashboardApplicationScope.Total ? "监控" : ApplicationScopeLabel(_applicationScope)) + "进程" : _dashboard?.IsLoading == true ? "正在汇总历史记录…" : searching ? "没有匹配的流量去向" : _trafficScope == DashboardTrafficScope.Proxy ? "当前范围暂无已确认代理流量" : "当前范围还没有流量记录";
-        EmptyHint.Text = _selectedTab == "sessions" ? "会话字节为所选应用的全部流量；每次停止监控后保存在本机" : _selectedTab == "processes" ? "当前进程显示所选应用的全部流量，与顶部历史累计分开统计" : searching ? "可搜索应用、域名、IP、地区、代理节点或路径类型" : _trafficScope == DashboardTrafficScope.Proxy ? "只包含记录时有代理证据的流量；未知未取得足够报告，不等于直连" : "开始监控后，用量会保存在本机，重启后继续累计";
+        EmptyHint.Text = _selectedTab == "sessions" ? "会话字节为所选应用的全部流量；每次停止监控后保存在本机" : _selectedTab == "processes" ? "当前进程显示所选应用的全部流量，与顶部历史累计分开统计" : searching ? "可搜索应用、域名、IP、地区、代理节点或路径类型" : _trafficScope == DashboardTrafficScope.Proxy ? "只包含记录时有代理证据的流量；“未知”表示未取得足够报告，不等于直连" : "开始监控后，用量会保存在本机，重启后继续累计";
         TableHintText.Text = ApplicationScopeLabel(_applicationScope) + " · " + (_selectedTab == "targets" ? RangeLabel(_range) + " · " + TrafficScopeLabel(_trafficScope) + " · 点击目标查看详情" : _selectedTab == "processes" ? "当前存活进程 · 全部流量 · 字节为本次监控值" : "全部流量 · 开始于所选时间范围的历史会话");
         TargetCountText.Text = (_selectedTab == "targets" && searching ? count + " / " + _targetTotalCount : count.ToString()) + (_selectedTab == "targets" ? " 个目标" : _selectedTab == "processes" ? " 个进程" : " 个会话");
     }
