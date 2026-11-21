@@ -34,8 +34,10 @@ public sealed class LocalProxyHints : IDisposable
     private readonly ProxyControllerPollOrder _pollOrder = new();
     private readonly ProxyHttpClientPool _clients = new(32);
     private readonly object _publishGate = new();
+    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(500);
     private int _refreshing;
     private int _disposed;
+    private int _polling;
 
     public LocalProxyHints() : this(ReadControllers, true) { }
 
@@ -44,8 +46,9 @@ public sealed class LocalProxyHints : IDisposable
         _controllers = new ProxyControllerDiscoveryCache(readControllers);
         // The token remains usable by callbacks already in flight after Dispose.
         _stopToken = _stop.Token;
+        _polling = startTimer ? 1 : 0;
         _timer = new System.Threading.Timer(_ => _ = RefreshAsync(), null,
-            startTimer ? TimeSpan.Zero : Timeout.InfiniteTimeSpan, TimeSpan.FromMilliseconds(500));
+            startTimer ? TimeSpan.Zero : Timeout.InfiniteTimeSpan, PollInterval);
     }
 
     /// <summary>
@@ -394,9 +397,26 @@ public sealed class LocalProxyHints : IDisposable
         return field.ValueKind == JsonValueKind.String && int.TryParse(field.GetString(), NumberStyles.None, CultureInfo.InvariantCulture, out number) ? number : 0;
     }
 
+    internal bool IsPolling => Volatile.Read(ref _polling) == 1 && Volatile.Read(ref _disposed) == 0;
+
+    /// <summary>
+    /// Pauses or resumes the 500 ms controller poll. Lookups only use snapshots
+    /// observed within the last five seconds, so a resumed poll never serves
+    /// connections from before the pause.
+    /// </summary>
+    internal void SetPolling(bool enabled)
+    {
+        if (Volatile.Read(ref _disposed) != 0) return;
+        int desired = enabled ? 1 : 0;
+        if (Interlocked.Exchange(ref _polling, desired) == desired) return;
+        try { _timer.Change(enabled ? TimeSpan.Zero : Timeout.InfiniteTimeSpan, enabled ? PollInterval : Timeout.InfiniteTimeSpan); }
+        catch (ObjectDisposedException) { }
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        Volatile.Write(ref _polling, 0);
         _timer.Dispose();
         _stop.Cancel();
         _controllers.Dispose();

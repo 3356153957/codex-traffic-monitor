@@ -82,7 +82,10 @@ public partial class MainWindow : Window
         _timer.Tick += (_, _) => RefreshSnapshot(true);
         IsVisibleChanged += (_, _) =>
         {
-            if (_windowLoaded && !IsVisible && !_demo && string.IsNullOrWhiteSpace(PreviewOutputPath)) ReleaseDashboardView();
+            bool liveWindow = !_demo && string.IsNullOrWhiteSpace(PreviewOutputPath);
+            if (_windowLoaded && !IsVisible && liveWindow) ReleaseDashboardView();
+            // A hidden window that is not capturing has no use for live polling.
+            if (liveWindow) _engine.ViewerActive = IsVisible;
         };
         Loaded += Window_Loaded;
         Closing += Window_Closing;
@@ -120,6 +123,8 @@ public partial class MainWindow : Window
         // Never show the main HWND during login. Hiding inside Loaded can leave
         // a visible, unpainted window when WPF finishes its initial Show call.
         ShowInTaskbar = false;
+        // The window is never shown here, so IsVisibleChanged will not report it.
+        _engine.ViewerActive = false;
         new WindowInteropHelper(this).EnsureHandle();
         _ = InitializeRuntimeAsync();
     }

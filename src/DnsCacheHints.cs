@@ -13,6 +13,7 @@ public sealed class DnsCacheHints : IDisposable
     private readonly Func<long> _now;
     private Dictionary<string, DnsHintSet> _hints = new();
     private int _refreshing;
+    private int _polling;
     private volatile bool _disposed;
 
     public DnsCacheHints() : this(WindowsDnsCacheReader.Read, () => Environment.TickCount64, true) { }
@@ -21,8 +22,21 @@ public sealed class DnsCacheHints : IDisposable
     {
         _read = read;
         _now = now;
+        _polling = startTimer ? 1 : 0;
         _timer = new System.Threading.Timer(_ => Refresh(), null,
             startTimer ? 0 : Timeout.Infinite, startTimer ? RefreshMilliseconds : Timeout.Infinite);
+    }
+
+    internal bool IsPolling => Volatile.Read(ref _polling) == 1 && !_disposed;
+
+    /// <summary>Pauses or resumes the cache read; resuming reads immediately.</summary>
+    internal void SetPolling(bool enabled)
+    {
+        if (_disposed) return;
+        int desired = enabled ? 1 : 0;
+        if (Interlocked.Exchange(ref _polling, desired) == desired) return;
+        try { _timer.Change(enabled ? 0 : Timeout.Infinite, enabled ? RefreshMilliseconds : Timeout.Infinite); }
+        catch (ObjectDisposedException) { }
     }
 
     public string Lookup(string ip)

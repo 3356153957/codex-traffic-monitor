@@ -32,6 +32,8 @@ public sealed class MonitorEngine : IDisposable
     private double _upRate, _downRate;
     private double _codexUpRate, _codexDownRate, _claudeUpRate, _claudeDownRate;
     private int _maintenanceActive;
+    private long _maintenancePasses;
+    private volatile bool _viewerActive = true;
     private int _disposeStarted;
     private List<ConnectionInfo> _connections = new();
     private List<SessionRow> _history = new();
@@ -45,6 +47,36 @@ public sealed class MonitorEngine : IDisposable
     public bool IsRunning { get { lock (_gate) return _desired; } }
     public string LastError { get { lock (_gate) return _error; } }
     internal object DashboardVersion => _analytics.PublishedVersion;
+
+    /// <summary>
+    /// True while a window shows live data. An engine that is neither capturing
+    /// nor viewed has no consumer for process, connection, proxy, DNS or history
+    /// refreshes, so it pauses them; becoming visible refreshes immediately.
+    /// </summary>
+    public bool ViewerActive
+    {
+        get => _viewerActive;
+        set
+        {
+            _viewerActive = value;
+            ApplyPollingPolicy();
+            if (value && !_disposed)
+                try { _timer.Change(0, 1000); } catch (ObjectDisposedException) { }
+        }
+    }
+
+    internal static bool NeedsLiveData(bool capturing, bool viewerActive) => capturing || viewerActive;
+    internal bool LivePollingActive => _proxy.IsPolling && _dns.IsPolling;
+    internal long MaintenancePasses => Interlocked.Read(ref _maintenancePasses);
+
+    private void ApplyPollingPolicy()
+    {
+        bool capturing;
+        lock (_gate) capturing = _desired || _running;
+        bool live = NeedsLiveData(capturing, _viewerActive);
+        _proxy.SetPolling(live);
+        _dns.SetPolling(live);
+    }
 
     public MonitorEngine(string? dataDirectory = null)
     {
@@ -65,6 +97,7 @@ public sealed class MonitorEngine : IDisposable
             _error = "";
             _desired = true;
             _captureTask = Task.Run(Capture);
+            ApplyPollingPolicy(); // capture always needs live proxy and DNS hints
         }
     }
 
@@ -141,6 +174,7 @@ public sealed class MonitorEngine : IDisposable
                 }
                 _store = null;
                 _history = SessionStore.History(DataDirectory);
+                ApplyPollingPolicy();
             }
         }
     }
@@ -179,8 +213,10 @@ public sealed class MonitorEngine : IDisposable
         if (_disposed || Interlocked.Exchange(ref _maintenanceActive, 1) != 0) return;
         try
         {
-            bool running;
-            lock (_gate) running = _running;
+            bool running, capturing;
+            lock (_gate) { running = _running; capturing = _desired || _running; }
+            if (!NeedsLiveData(capturing, _viewerActive)) return;
+            Interlocked.Increment(ref _maintenancePasses);
             long refreshNow = Stopwatch.GetTimestamp();
             // ETW process start/stop events keep active capture identities current,
             // including tools that start and exit between full snapshots. A slower
