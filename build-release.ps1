@@ -14,7 +14,8 @@ if (-not $InnoCompiler) { $InnoCompiler = & (Join-Path $taskRoot 'tools\ensure-i
 & (Join-Path $taskRoot 'build.ps1') -OutputDirectory $payload -SkipTests:$SkipTests
 & (Join-Path $taskRoot 'build-installer.ps1') -PayloadDirectory $payload -OutputDirectory $destination -InnoCompiler $InnoCompiler
 $portable = Join-Path $destination "CodexTrafficMonitor-$version-win-x64-portable.zip"
-$names = @('CodexTrafficMonitor.exe', 'README.md', 'LICENSE', 'THIRD-PARTY-NOTICES.txt')
+$names = @('CodexTrafficMonitor.exe', 'README.md', 'LICENSE', 'THIRD-PARTY-NOTICES.txt', 'amd64') +
+    @(Get-ChildItem -LiteralPath $payload -Filter *.dll -File | ForEach-Object Name)
 Compress-Archive -LiteralPath @($names | ForEach-Object { Join-Path $payload $_ }) -DestinationPath $portable -Force
 $installer = Join-Path $destination "CodexTrafficMonitor-Setup-$version-win-x64.exe"
 $checksums = @($installer, $portable) | ForEach-Object {

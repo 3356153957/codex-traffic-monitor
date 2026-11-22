@@ -22,6 +22,9 @@ public sealed class StartupStatus
     public string ExecutablePath { get; set; } = "";
     public string TaskName { get; set; } = "";
     public string Error { get; set; } = "";
+    // False when the task's executable sits where an ordinary process could replace it.
+    public bool ExecutableProtected { get; set; }
+    public string Warning { get; set; } = "";
 }
 
 public static class StartupManager
@@ -76,7 +79,13 @@ public static class StartupManager
             folder = ((dynamic)service).GetFolder("\\");
             try { registered = ((dynamic)folder).GetTask(TaskName); }
             catch (Exception e) when ((uint)e.HResult is 0x80070002 or 0x8004130F) { return new() { TaskName = TaskName }; }
-            return ParseStatus((string)((dynamic)registered).Xml, (bool)((dynamic)registered).Enabled, UserSid, TaskName);
+            var status = ParseStatus((string)((dynamic)registered).Xml, (bool)((dynamic)registered).Enabled, UserSid, TaskName);
+            if (status.Owned)
+            {
+                status.ExecutableProtected = InstallLocationSecurity.IsProtected(status.ExecutablePath);
+                if (!status.ExecutableProtected && status.Enabled) status.Warning = UnprotectedTaskWarning(status.ExecutablePath);
+            }
+            return status;
         }
         catch (Exception e) { return new() { TaskName = TaskName, Error = "无法读取开机设置：" + e.Message }; }
         finally { Release(registered); Release(folder); Release(service); }
@@ -130,6 +139,8 @@ public static class StartupManager
             string executable = Environment.ProcessPath!;
             if (!Path.GetFileName(executable).Equals("CodexTrafficMonitor.exe", StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("请从发布的 CodexTrafficMonitor.exe 设置开机监控。");
+            if (enabled && !InstallLocationSecurity.IsProtected(executable))
+                throw new InvalidOperationException(ProtectedLocationError(executable));
             var before = ReadStatus();
             if (before.Error.Length > 0 && before.ExecutablePath.Length == 0) throw new InvalidOperationException(before.Error);
             service = Activator.CreateInstance(Type.GetTypeFromProgID("Schedule.Service", true)!);
@@ -182,6 +193,29 @@ public static class StartupManager
             File.WriteAllText(RequestFile(request), JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true }));
         }
         return result.Error.Length == 0 ? 0 : 1;
+    }
+
+    internal static string ProtectedLocationError(string executable) =>
+        "开机自动监控会在登录时以管理员权限运行程序，因此程序必须位于普通程序无法改写的目录。当前位置：" + executable +
+        "。请用安装包安装（默认 C:\\Program Files\\CodexTrafficMonitor）后，再从安装版开启。";
+
+    internal static string UnprotectedTaskWarning(string executable) =>
+        "开机任务指向普通程序可以改写的位置（" + executable + "），以管理员权限自动运行不安全。请用安装包安装后重新开启。";
+
+    // A logon task created by an older version may point at a per-user or portable
+    // copy. Running elevated from such a task is a silent elevation path, so the
+    // elevated instance removes it; the user can re-enable from the installed copy.
+    public static bool DisableUnprotectedTask(out string message)
+    {
+        message = "";
+        if (!IsAdmin) return false;
+        var status = ReadStatus();
+        if (!status.Exists || !status.Owned || !status.Enabled || status.ExecutableProtected) return false;
+        var after = Configure(false, status.ExecutablePath);
+        if (after.Exists && after.Enabled) return false;
+        message = "已关闭开机自动监控：任务指向的 " + status.ExecutablePath +
+            " 位于普通程序可以改写的目录，登录时以管理员权限运行不安全。请用安装包安装到 Program Files 后，在监控设置中重新开启。";
+        return true;
     }
 
     private static string RequestFile(string request) => Path.Combine(DataDirectory, "startup-requests", Guid.ParseExact(request, "N").ToString("N") + ".json");

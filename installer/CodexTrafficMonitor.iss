@@ -29,10 +29,13 @@ AppName={#ProductName}
 AppVersion={#AppVersion}
 AppVerName={#ProductName} {#AppVersion}
 AppPublisher=Codex Traffic Monitor contributors
-DefaultDirName={localappdata}\Programs\CodexTrafficMonitor{#FileSuffix}
+; Per-machine: the logon task runs the monitor elevated without a UAC prompt, so
+; the EXE and its native DLLs must not be writable by ordinary processes.
+DefaultDirName={autopf}\CodexTrafficMonitor{#FileSuffix}
 DefaultGroupName={#ProductGroup}
 DisableProgramGroupPage=yes
-PrivilegesRequired=lowest
+PrivilegesRequired=admin
+UsedUserAreasWarning=no
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
@@ -66,8 +69,12 @@ Source: "{#PayloadDirectory}\{#ProductExe}"; DestDir: "{app}"; Flags: ignorevers
 Source: "{#PayloadDirectory}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDirectory}\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDirectory}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDirectory}\*.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDirectory}\amd64\*.dll"; DestDir: "{app}\amd64"; Flags: ignoreversion
 ; The embedded copy can prepare an upgrade before the installed EXE is replaced.
 Source: "{#PayloadDirectory}\{#ProductExe}"; Flags: dontcopy
+; WPF's C++/CLI shutdown needs vcruntime140_cor3.dll (and its siblings) beside the EXE.
+Source: "{#PayloadDirectory}\*.dll"; Flags: dontcopy
 
 [Icons]
 Name: "{group}\{#ProductName}"; Filename: "{app}\{#ProductExe}"; WorkingDir: "{app}"
@@ -128,6 +135,11 @@ begin
   if PreparationComplete then Exit;
   if MaintenanceState = '' then MaintenanceState := ExpandConstant('{tmp}\codex-traffic-maintenance.json');
   ExtractTemporaryFile('{#ProductExe}');
+  ExtractTemporaryFile('vcruntime140_cor3.dll');
+  ExtractTemporaryFile('D3DCompiler_47_cor3.dll');
+  ExtractTemporaryFile('PenImc_cor3.dll');
+  ExtractTemporaryFile('PresentationNative_cor3.dll');
+  ExtractTemporaryFile('wpfgfx_cor3.dll');
   if not RunMaintenance(ExpandConstant('{tmp}\{#ProductExe}'), 'prepare', ExitCode) then
   begin
     Result := '无法启动安装检查程序。请检查安全软件是否拦截，然后重试。';
@@ -143,6 +155,25 @@ begin
 #endif
 end;
 
+// Versions up to 1.5.8 installed per user under %LOCALAPPDATA%\Programs. After the
+// logon task has moved to the per-machine copy, remove that copy with its own
+// uninstaller; it keeps the history and only removes a task that still points at it.
+procedure RemovePerUserInstall;
+var
+  Uninstaller: String;
+  ExitCode: Integer;
+begin
+  if not RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#ProductId}_is1',
+    'UninstallString', Uninstaller) then Exit;
+  Uninstaller := RemoveQuotes(Uninstaller);
+  if (not FileExists(Uninstaller)) or
+    (CompareText(AddBackslash(ExtractFileDir(Uninstaller)), AddBackslash(ExpandConstant('{app}'))) = 0) then Exit;
+  if Exec(Uninstaller, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then
+    Log('Per-user copy uninstaller finished with code ' + IntToStr(ExitCode) + ': ' + Uninstaller)
+  else
+    Log('Per-user copy uninstaller could not start: ' + Uninstaller);
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ExitCode: Integer;
@@ -154,6 +185,7 @@ begin
       FinishMaintenanceError := '未能启动自动监控迁移。'
     else if ExitCode <> 0 then
       FinishMaintenanceError := '自动监控迁移未完成，返回码：' + IntToStr(ExitCode) + '。';
+    if FinishMaintenanceError = '' then RemovePerUserInstall;
     if FinishMaintenanceError <> '' then
     begin
       Log(FinishMaintenanceError);

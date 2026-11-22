@@ -79,6 +79,12 @@ internal sealed class TrayController : IDisposable
 
     internal void DismissHiddenNotification() { _toast?.Dismiss(); _toast = null; }
 
+    internal void ShowWarning(string title, string text)
+    {
+        if (_disposed) return;
+        _icon.ShowBalloonTip(15000, title, text, Forms.ToolTipIcon.Warning);
+    }
+
     public void Dispose()
     {
         if (_disposed) return;

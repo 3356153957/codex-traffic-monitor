@@ -27,15 +27,17 @@ Windows 本地程序，累计记录 Codex、Claude 桌面端、CLI 和派生工�
 支持 Windows 10/11 x64，安装包自带 .NET 运行时。
 
 1. 在 [Releases](https://github.com/3356153957/codex-traffic-monitor/releases/latest) 下载 `CodexTrafficMonitor-Setup-版本-win-x64.exe`。
-2. 双击安装向导，选择安装位置和是否创建桌面快捷方式。默认安装到当前用户的 `%LOCALAPPDATA%\Programs\CodexTrafficMonitor`。
+2. 双击安装向导并确认 Windows UAC，选择安装位置和是否创建桌面快捷方式。默认安装到 `C:\Program Files\CodexTrafficMonitor`（所有用户共用程序，历史仍按用户分开保存）。
 3. 打开程序，点击“以管理员身份开始”并确认 Windows UAC，开始记录。内核采集需要管理员权限，普通查看不需要。
 4. 如需登录 Windows 后自动记录，在“监控设置”里开启“开机自动监控”。
 
-安装/升级前，请从旧版“监控设置 → 退出程序”或托盘菜单退出；只关闭窗口会继续后台记录。新版之间可请求正常退出并保存，旧便携版不支持时安装器会提示手动退出，不会强制结束进程。此前启用的自启会迁移到安装路径，首次迁移可能需要一次 UAC；取消后可在监控设置里重新开启。
+安装/升级前，请从旧版“监控设置 → 退出程序”或托盘菜单退出；只关闭窗口会继续后台记录。新版之间可请求正常退出并保存，旧便携版不支持时安装器会提示手动退出，不会强制结束进程。此前启用的自启会迁移到安装路径，取消后可在监控设置里重新开启。从 1.5.8 及更早的当前用户安装版升级时，迁移完成后会自动卸载 `%LOCALAPPDATA%\Programs` 中的旧副本，历史记录保留。
+
+开机自动监控会在登录时以管理员权限运行程序、不再弹出 UAC，所以程序和旁边的 DLL 必须位于普通程序无法改写的目录。程序只在这种位置（例如默认的 Program Files）注册开机任务；若旧版本的开机任务指向当前用户目录或便携目录，新版以管理员身份运行时会自动关闭它并提示。原生 DLL 随程序放在安装目录，不再解压到 `%TEMP%`。
 
 卸载可通过 Windows“已安装的应用”或开始菜单完成。卸载仅移除本安装路径对应的程序与自启，保留历史流量目录。当前发布未做代码签名，可用 Release 中的 `SHA256SUMS.txt` 核对下载文件。
 
-也提供 `*-portable.zip` 免安装版，解压后运行 EXE。安装版与便携版共用当前用户的流量历史，同一用户只运行一个采集实例。
+也提供 `*-portable.zip` 免安装版，完整解压（含 `amd64` 文件夹和 DLL）后运行 EXE。便携版可以手动以管理员身份记录，但不能开启开机自动监控。安装版与便携版共用当前用户的流量历史，同一用户只运行一个采集实例。
 
 ## 使用
 
@@ -168,7 +170,7 @@ Claude 支持 Windows 桌面版、原生 CLI、npm 原生二进制和旧 Node CL
 - [Windows 系统追踪会话权限](https://learn.microsoft.com/en-us/windows/win32/etw/configuring-and-starting-a-systemtraceprovider-session)
 - [Get-DnsClientCache](https://learn.microsoft.com/en-us/powershell/module/dnsclient/get-dnsclientcache)
 
-使用 Microsoft.Diagnostics.Tracing.TraceEvent 3.2.8、MaxMind.Db 5.2.0 和 .NET 8 Windows Desktop Runtime；自包含发布包带运行时，目标机器无需另外安装 .NET SDK。不打包用户自己的地理库和代理配置。第三方许可见发布目录 `THIRD-PARTY-NOTICES.txt`。
+使用 Microsoft.Diagnostics.Tracing.TraceEvent 4.0.2、MaxMind.Db 5.3.0 和 .NET 8 Windows Desktop Runtime；自包含发布包带运行时，目标机器无需另外安装 .NET SDK。不打包用户自己的地理库和代理配置。第三方许可见发布目录 `THIRD-PARTY-NOTICES.txt`。
 
 首页的信息层级参考 [Grafana 仪表盘设计指南](https://grafana.com/docs/grafana/latest/visualizations/dashboards/build-dashboards/best-practices/)；图表采用便于比较数量的长度与位置编码，参考 [NN/g 的仪表盘图表建议](https://www.nngroup.com/articles/dashboards-preattentive/)。
 

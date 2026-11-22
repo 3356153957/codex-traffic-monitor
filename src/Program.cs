@@ -40,6 +40,13 @@ public static class Program
                 return StartupManager.ConfigureCommand(option == "on", ValueAfter(args, "--request"), ValueAfter(args, "--owner-sid"), ValueAfter(args, "--expected-executable"));
             }
             if (args.Contains("--startup-status")) { WriteJson(ValueAfter(args, "--startup-status") ?? "startup-status.json", StartupManager.ReadStatus()); return 0; }
+            if (args.Contains("--location-check"))
+            {
+                // Reports whether this copy may run elevated at logon (see InstallLocationSecurity).
+                string executable = Environment.ProcessPath!;
+                WriteJson(ValueAfter(args, "--location-check") ?? "location-check.json", new { executable, protectedForElevatedAutostart = InstallLocationSecurity.IsProtected(executable) });
+                return 0;
+            }
             if (args.Contains("--dashboard-snapshot"))
             {
                 var history = new HistoryAnalytics(StartupManager.DataDirectory);
@@ -97,6 +104,12 @@ public static class Program
                     window.InitializeInTray();
                     if (args.Contains("--start")) monitor.Start();
                     instance?.ApplyPendingRequests();
+                    // An old logon task may point at a per-user copy; never keep a silent elevation path.
+                    Task.Run(() =>
+                    {
+                        try { if (StartupManager.DisableUnprotectedTask(out string message)) window.Dispatcher.BeginInvoke(() => window.NotifyStartupWarning(message)); }
+                        catch { /* The scheduler is unavailable; the settings tooltip still shows the warning. */ }
+                    });
                 };
                 return app.Run();
             }
@@ -112,7 +125,7 @@ public static class Program
             string directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexTrafficMonitor");
             Directory.CreateDirectory(directory);
             File.AppendAllText(Path.Combine(directory, "errors.log"), DateTime.Now.ToString("O") + " " + e + Environment.NewLine);
-            if (!args.Any(x => x.StartsWith("--self-test") || x.StartsWith("--capture-probe") || x.StartsWith("--snapshot") || x.StartsWith("--configure-startup") || x.StartsWith("--startup-status") || x.StartsWith("--dashboard-snapshot") || x.StartsWith("--maintenance") || x.StartsWith("--check-updates") || x.StartsWith("--resource-probe")))
+            if (!args.Any(x => x.StartsWith("--self-test") || x.StartsWith("--capture-probe") || x.StartsWith("--snapshot") || x.StartsWith("--configure-startup") || x.StartsWith("--startup-status") || x.StartsWith("--dashboard-snapshot") || x.StartsWith("--maintenance") || x.StartsWith("--check-updates") || x.StartsWith("--resource-probe") || x.StartsWith("--location-check")))
                 MessageBox.Show(e.Message, "Codex 流量观察", MessageBoxButton.OK, MessageBoxImage.Error);
             return 1;
         }

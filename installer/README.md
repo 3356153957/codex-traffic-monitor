@@ -1,6 +1,6 @@
 # Windows 安装包
 
-安装包由 Inno Setup 7.1.1 编译，默认为当前用户安装到 `%LOCALAPPDATA%\Programs\CodexTrafficMonitor`，提供开始菜单、可选桌面快捷方式和 Windows 卸载入口。安装程序不修改代理配置，不删除 `%LOCALAPPDATA%\CodexTrafficMonitor` 中的历史记录。
+安装包由 Inno Setup 7.1.1 编译，需要管理员确认，默认安装到 `C:\Program Files\CodexTrafficMonitor`，提供开始菜单、可选桌面快捷方式和 Windows 卸载入口。开机任务会以管理员权限静默运行程序，因此程序必须位于普通进程无法改写的目录；1.5.8 及更早版本的当前用户安装在迁移完成后由其自带卸载程序静默移除。安装程序不修改代理配置，不删除 `%LOCALAPPDATA%\CodexTrafficMonitor` 中的历史记录。
 
 在 Windows PowerShell 7 中运行：
 
@@ -12,7 +12,7 @@ $compiler = ./tools/ensure-inno-setup.ps1
 
 `ensure-inno-setup.ps1` 从 [Inno Setup 官方发布](https://github.com/jrsoftware/issrc/releases/tag/is-7_1_1)下载固定版本，核验 SHA-256 和 `Pyrsys B.V.` 的 Authenticode 签名，然后以官方便携模式解包到项目 `.tools`，不做系统全局安装。也可直接通过 `-InnoCompiler` 指定已安装的 Inno Setup 7.1.1 或更新版。
 
-安装器只打包发布目录中的 `CodexTrafficMonitor.exe`、`README.md`、`LICENSE` 和 `THIRD-PARTY-NOTICES.txt`，不会收集用户数据或本机验证报告。
+安装器只打包发布目录中的 `CodexTrafficMonitor.exe`、旁边的原生 DLL（WPF 与 `amd64` 下的 TraceEvent 组件）、`README.md`、`LICENSE` 和 `THIRD-PARTY-NOTICES.txt`，不会收集用户数据或本机验证报告。维护检查从临时目录运行时，会同时解出根目录的 WPF DLL，否则 WPF 的 C++/CLI 组件会在进程退出时找不到 `vcruntime140_cor3.dll`。
 
 升级前由临时目录中的新程序执行 `--maintenance prepare`，正常保存并退出同用户的监控实例。旧版不支持安全退出时，安装器提示用户从监控设置或托盘退出后重试。安装器不会强制终止进程，也不使用 Windows Restart Manager 结束其他应用。
 

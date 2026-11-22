@@ -12,7 +12,8 @@ $project = [xml](Get-Content -Encoding UTF8 -LiteralPath (Join-Path $taskRoot 's
 $version = [string]$project.Project.PropertyGroup.Version
 if ($version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') { throw "不支持的安装版本：$version" }
 $executable = Join-Path $payload 'CodexTrafficMonitor.exe'
-foreach ($name in @('CodexTrafficMonitor.exe', 'README.md', 'LICENSE', 'THIRD-PARTY-NOTICES.txt')) {
+$natives = @('D3DCompiler_47_cor3.dll', 'PenImc_cor3.dll', 'PresentationNative_cor3.dll', 'vcruntime140_cor3.dll', 'wpfgfx_cor3.dll', 'amd64\KernelTraceControl.dll', 'amd64\msdia140.dll')
+foreach ($name in @('CodexTrafficMonitor.exe', 'README.md', 'LICENSE', 'THIRD-PARTY-NOTICES.txt') + $natives) {
     if (-not (Test-Path -LiteralPath (Join-Path $payload $name) -PathType Leaf)) { throw "安装源缺少 $name，请先运行 build.ps1。" }
 }
 $payloadVersion = (Get-Item -LiteralPath $executable).VersionInfo.ProductVersion -replace '\+.*$', ''

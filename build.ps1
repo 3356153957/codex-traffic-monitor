@@ -11,7 +11,10 @@ $testOutput = Join-Path $taskRoot 'output\self-test.json'
 New-Item -ItemType Directory -Path (Join-Path $taskRoot 'output') -Force | Out-Null
 # The installer/ZIP already compress downloads. Compressing assemblies again in
 # the single-file host retains decompression buffers in the running process.
-& $dotnet publish $project -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=false -o $destination --nologo
+# Native DLLs (WPF, TraceEvent amd64\*) stay beside the EXE instead of being
+# extracted to %TEMP%\.net, where any process of the user could replace them
+# before the elevated monitor loads them.
+& $dotnet publish $project -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=false -p:EnableCompressionInSingleFile=false -o $destination --nologo
 if ($LASTEXITCODE -ne 0) { throw '发布失败。' }
 # The compiler and MSBuild servers otherwise stay resident (~400 MB) after a one-off publish.
 & $dotnet build-server shutdown | Out-Null

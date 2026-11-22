@@ -748,8 +748,16 @@ public partial class MainWindow : Window
         StartupCheck.ToolTip = "登录 Windows 后自动在后台开始记录。首次设置需确认 Windows UAC，仅注册计划任务，不保存密码。"
             + (status.Enabled ? "\n已启用，关闭窗口后仍会在系统托盘运行。" : "\n当前未启用。")
             + (!string.IsNullOrWhiteSpace(status.ExecutablePath) ? "\n启动程序：" + status.ExecutablePath : "")
-            + (!string.IsNullOrWhiteSpace(status.Error) ? "\n" + status.Error : "");
+            + (!string.IsNullOrWhiteSpace(status.Error) ? "\n" + status.Error : "")
+            + (!string.IsNullOrWhiteSpace(status.Warning) ? "\n" + status.Warning : "");
         OptionsSummaryText.Text = (ChildrenCheck.IsChecked == true ? "派生工具已计入" : "仅核心进程") + (status.Enabled ? " · 自动启动已开启" : "");
+    }
+
+    internal void NotifyStartupWarning(string message)
+    {
+        if (_disposed) return;
+        _tray?.ShowWarning("开机自动监控已关闭", message);
+        _ = RefreshStartupStatusAsync();
     }
 
     private void HideToTray(bool notify = true)

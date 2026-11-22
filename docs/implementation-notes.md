@@ -16,4 +16,6 @@
 
 明细写入复用单行 UTF-8 缓冲，减少大量连接同时入账时的临时内存，每批仍刷新到磁盘。代理采样优先使用当前配置里最近可用的控制器，减少失效候选反复超时；配置变化或控制器失效时重新选择。
 
-单文件 EXE 自带运行时，采用无需运行时解压程序集的打包方式，以降低常驻内存；安装包和便携 ZIP 仍压缩下载。
+单文件 EXE 自带运行时，采用无需运行时解压程序集的打包方式，以降低常驻内存；安装包和便携 ZIP 仍压缩下载。原生 DLL 不打进单文件（`IncludeNativeLibrariesForSelfExtract=false`），随 EXE 放在安装目录：自解压会写到 `%TEMP%\.net`，同用户的普通进程可以抢先放入同名 DLL，再由提权后的监控程序加载。
+
+开机任务以 `HighestAvailable` 运行，登录时不经 UAC。`InstallLocationSecurity` 只在 EXE、同目录 DLL、`amd64` 及各级父目录都没有非管理员可写、可删改子项或可改权限的条目，且所有者是 SYSTEM、Administrators 或 TrustedInstaller 时，才允许注册该任务；`--location-check` 可输出当前副本的判断。
