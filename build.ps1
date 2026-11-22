@@ -13,6 +13,8 @@ New-Item -ItemType Directory -Path (Join-Path $taskRoot 'output') -Force | Out-N
 # the single-file host retains decompression buffers in the running process.
 & $dotnet publish $project -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=false -o $destination --nologo
 if ($LASTEXITCODE -ne 0) { throw '发布失败。' }
+# The compiler and MSBuild servers otherwise stay resident (~400 MB) after a one-off publish.
+& $dotnet build-server shutdown | Out-Null
 Copy-Item -LiteralPath (Join-Path $taskRoot 'README.md') -Destination $destination
 Copy-Item -LiteralPath (Join-Path $taskRoot 'THIRD-PARTY-NOTICES.txt') -Destination $destination
 Copy-Item -LiteralPath (Join-Path $taskRoot 'LICENSE') -Destination $destination
