@@ -7,6 +7,7 @@
 - 安全：只有 EXE 与所在目录不可被普通程序改写时才注册开机自动监控；便携版或自选目录给出说明。旧版本留下、指向不安全位置的开机任务，在新版以管理员身份运行时自动关闭并提示。新增 `--location-check` 诊断命令。
 - 依赖：Microsoft.Diagnostics.Tracing.TraceEvent 3.2.8 → 4.0.2，MaxMind.Db 5.2.0 → 5.3.0。管理员实测采集 20 MB 下载：3.2.8 记 20,033,788 字节，4.0.2 记 20,033,484 字节，均为载荷加 TLS 开销。
 - 便携 ZIP 现在包含 DLL 与 `amd64` 文件夹，需完整解压。
+- 构建通过 `global.json` 固定 .NET 8 SDK：CI 默认的 .NET 11 SDK 在不自解压原生库时会漏掉 TraceEvent 的 `amd64` DLL（NETSDK1236）。
 
 ## 1.5.8 · 2026-11-22
 
