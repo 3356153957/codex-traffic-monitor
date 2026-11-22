@@ -63,6 +63,13 @@ internal static class IdlePollingSelfTests
         timerless.Dispose();
         checks.Add("Pausing or resuming after the underlying timer was disposed is harmless");
 
+        long heapBefore = GC.GetTotalMemory(false);
+        var garbage = new byte[8 * 1024 * 1024];
+        garbage[^1] = 1;
+        garbage = null;
+        IdleMemory.Trim();
+        Check(GC.GetTotalMemory(false) <= heapBefore + 1024 * 1024, "The idle trim collects large unreachable buffers without throwing");
+
         string directory = Path.Combine(Path.GetTempPath(), "CodexIdlePolling", Guid.NewGuid().ToString("N"));
         try
         {
@@ -78,6 +85,19 @@ internal static class IdlePollingSelfTests
             engine.ViewerActive = true;
             Check(engine.LivePollingActive && WaitFor(() => engine.MaintenancePasses > idle, 900),
                 "Showing the window resumes polling and refreshes immediately");
+
+            int trims = 0;
+            engine.IdleTrimDelay = TimeSpan.FromMilliseconds(300);
+            engine.TrimMemory = () => Interlocked.Increment(ref trims);
+            engine.ViewerActive = false;
+            Check(WaitFor(() => Volatile.Read(ref trims) == 1, 2000), "Becoming idle and hidden trims memory once after a short delay");
+            Thread.Sleep(700);
+            Check(Volatile.Read(ref trims) == 1, "An idle engine does not keep trimming memory");
+            engine.ViewerActive = true;
+            engine.ViewerActive = false;
+            engine.ViewerActive = true;
+            Thread.Sleep(700);
+            Check(Volatile.Read(ref trims) == 1, "Showing the window again before the delay cancels the pending trim");
         }
         finally
         {

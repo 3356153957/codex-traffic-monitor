@@ -34,6 +34,12 @@ public sealed class MonitorEngine : IDisposable
     private int _maintenanceActive;
     private long _maintenancePasses;
     private volatile bool _viewerActive = true;
+    private readonly object _idleGate = new();
+    private bool _lastLive = true;
+    private System.Threading.Timer? _idleTrimTimer;
+    /// <summary>Delay before an idle, hidden engine trims memory (lets the hidden view finish releasing).</summary>
+    internal TimeSpan IdleTrimDelay { get; set; } = TimeSpan.FromSeconds(10);
+    internal Action TrimMemory { get; set; } = IdleMemory.Trim;
     private int _disposeStarted;
     private List<ConnectionInfo> _connections = new();
     private List<SessionRow> _history = new();
@@ -76,6 +82,28 @@ public sealed class MonitorEngine : IDisposable
         bool live = NeedsLiveData(capturing, _viewerActive);
         _proxy.SetPolling(live);
         _dns.SetPolling(live);
+        ScheduleIdleTrim(live);
+    }
+
+    // Trim once per transition into idle; becoming live again cancels a pending trim.
+    private void ScheduleIdleTrim(bool live)
+    {
+        lock (_idleGate)
+        {
+            if (_disposed || live == _lastLive) return;
+            _lastLive = live;
+            if (live) { _idleTrimTimer?.Change(Timeout.Infinite, Timeout.Infinite); return; }
+            _idleTrimTimer ??= new System.Threading.Timer(_ => TrimIfStillIdle(), null, Timeout.Infinite, Timeout.Infinite);
+            _idleTrimTimer.Change(IdleTrimDelay, Timeout.InfiniteTimeSpan);
+        }
+    }
+
+    private void TrimIfStillIdle()
+    {
+        bool capturing;
+        lock (_gate) capturing = _desired || _running;
+        lock (_idleGate) if (_disposed || _lastLive || NeedsLiveData(capturing, _viewerActive)) return;
+        try { TrimMemory(); } catch { }
     }
 
     public MonitorEngine(string? dataDirectory = null)
@@ -435,6 +463,7 @@ public sealed class MonitorEngine : IDisposable
         if (Interlocked.Exchange(ref _disposeStarted, 1) != 0) return;
         _disposed = true;
         _timer.Dispose();
+        lock (_idleGate) _idleTrimTimer?.Dispose();
         Stop();
         try { _captureTask?.Wait(TimeSpan.FromSeconds(5)); } catch { }
         _dns.Dispose();
